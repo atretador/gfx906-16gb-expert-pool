@@ -19,6 +19,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -272,6 +273,8 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.expert_cache_slots = params.expert_cache_slots;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -384,6 +387,9 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        cparams.type_k = params.type_k;
+        cparams.type_v = params.type_v;
+
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
@@ -579,6 +585,146 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+void llama_context::init_expert_pools() {
+    expert_pools.clear();
+
+    if (cparams.expert_cache_slots <= 0) {
+        return;
+    }
+
+    if (cparams.pipeline_parallel) {
+        // the pool slots are overwritten in stream order; with pipeline parallelism a
+        // previous computation may still be reading the pool when the next one updates it
+        LLAMA_LOG_WARN("%s: expert cache disabled: not supported with pipeline parallelism\n", __func__);
+        return;
+    }
+
+    {
+        int n_accel = 0;
+        for (const auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_accel++;
+            }
+        }
+        if (n_accel > 1) {
+            // pools would live on the first accelerator while some layers run on
+            // others - the pooled FFNs would either migrate devices or copy the pool
+            // cross-device every step. untested and likely slower than the stock path.
+            LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports exactly one\n", __func__, n_accel);
+            return;
+        }
+    }
+
+    // experts are pooled on the compute backend running the layers (the first accelerator)
+    // TODO: with multiple accelerators, pick the backend of each layer instead
+    int backend_id = -1;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i].get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        backend_id = i;
+        break;
+    }
+    if (backend_id < 0) {
+        LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
+        return;
+    }
+
+    int n_pooled = 0;
+    int n_skipped = 0;
+
+    // the pool takes VRAM that the KV cache would otherwise grow into, so size the
+    // budget under an absolute rail: estimated max-context KV plus a fixed reserve
+    // must stay free, otherwise a run that is fine when cold hits the paging line at
+    // depth (858 MiB free vs 775 MiB free was measured at -1% vs -11% decode and
+    // 2.3x TTFT on a 32 GB WDDM card). note the estimate covers only the per-token
+    // growth (attention KV); recurrent-state and compute buffers are bounded and
+    // share the fixed reserve.
+    ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
+    size_t dev_free = 0;
+    size_t dev_total = 0;
+    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+
+    size_t kv_max = 0;
+    for (int il = 0; il < (int) model.layers.size(); ++il) {
+        kv_max += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
+                + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+    }
+    kv_max *= cparams.n_ctx;
+
+    constexpr size_t pool_rail = 1024ull * 1024 * 1024; // keep >= 1 GiB free at max context
+    size_t pool_budget = (dev_free > kv_max + pool_rail) ? (dev_free - kv_max - pool_rail) : 0;
+
+    LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
+            __func__, pool_budget / 1024.0 / 1024.0 / 1024.0, dev_free / 1024.0 / 1024.0 / 1024.0,
+            kv_max / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    if (pool_budget == 0) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM minus max-context KV leaves less than the %.2f GiB rail\n",
+                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    }
+
+    // pool every MoE expert weight tensor that is actually offloaded to the host; when a
+    // layer has both fused gate_up and separate gate/up tensors only the fused one is
+    // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
+    for (const auto & layer : model.layers) {
+        // the collector is unbounded on purpose: expert-tensor layouts vary by arch
+        // (fused gate_up + down, separate up/gate/down, ...) and future ones may carry
+        // any number of expert tensors per layer
+        std::vector<ggml_tensor *> tensors;
+        if (layer.ffn_gate_up_exps != nullptr) {
+            tensors.push_back(layer.ffn_gate_up_exps);
+        } else {
+            if (layer.ffn_up_exps   != nullptr) tensors.push_back(layer.ffn_up_exps);
+            if (layer.ffn_gate_exps != nullptr) tensors.push_back(layer.ffn_gate_exps);
+        }
+        if (layer.ffn_down_exps != nullptr) {
+            tensors.push_back(layer.ffn_down_exps);
+        }
+
+        for (ggml_tensor * w : tensors) {
+            if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
+                continue;
+            }
+
+            const int n_expert = (int) w->ne[2];
+            const int n_slots  = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
+            if (n_slots <= 0) {
+                continue;
+            }
+
+            const size_t pool_size = (size_t) n_slots * w->nb[2];
+            if (pool_size > pool_budget) {
+                n_skipped++;
+                LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
+                        __func__, w->name, n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
+                continue;
+            }
+            pool_budget -= pool_size;
+
+            ggml_tensor * table = nullptr;
+            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
+            if (pool == nullptr) {
+                continue; // allocation failed, keep serving this tensor from host memory
+            }
+
+            expert_pools.emplace(w, llama_expert_pool{pool, table});
+            n_pooled++;
+        }
+    }
+
+    if (n_pooled > 0) {
+        LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
+                __func__, n_pooled, n_skipped);
+    } else if (n_skipped > 0) {
+        // every candidate was found but the budget rejected them all - saying "no
+        // offloaded tensors found" here sent the last reporter chasing a ghost
+        LLAMA_LOG_WARN("%s: expert cache had no effect: 0 of %d offloaded MoE expert weight tensors fit the VRAM budget - all layers run the stock host-copy path\n",
+                __func__, n_skipped);
+    } else {
+        LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -606,6 +752,8 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    init_expert_pools();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -641,6 +789,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                init_expert_pools();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2510,6 +2659,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_pools=*/ expert_pools.empty() ? nullptr : &expert_pools,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3654,6 +3804,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.expert_cache_slots          =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

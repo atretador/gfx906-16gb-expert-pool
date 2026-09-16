@@ -265,6 +265,10 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // register persistent VRAM expert slot pools for the offloaded MoE expert weight tensors
+    // (cparams.expert_cache_slots > 0), called once after the scheduler is created
+    void init_expert_pools();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -286,6 +290,9 @@ private:
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
+
+    // expert weight pools by original weight tensor, filled by init_expert_pools()
+    llama_expert_pools expert_pools;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

@@ -2770,6 +2770,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"-mec", "--moe-expert-cache"}, "N",
+        "keep a cache of N experts per offloaded MoE weight tensor in VRAM\n"
+        "hot experts are served from VRAM across decode steps, only cache misses are\n"
+        "copied from the CPU (requires --cpu-moe/--n-cpu-moe or tensor overrides, 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

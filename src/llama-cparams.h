@@ -21,6 +21,9 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
+    int32_t  expert_cache_slots = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 
@@ -62,6 +65,10 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // cache element types (mirror of the memory module params, for size estimation)
+    ggml_type type_k = GGML_TYPE_F16;
+    ggml_type type_v = GGML_TYPE_F16;
 
     llama_context * ctx_other;
 };

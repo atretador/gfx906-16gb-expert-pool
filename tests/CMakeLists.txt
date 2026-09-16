@@ -379,3 +379,6 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# needs an accelerator backend (Metal/CUDA/...), skips otherwise
+llama_build_and_test(test-expert-pool.cpp)
