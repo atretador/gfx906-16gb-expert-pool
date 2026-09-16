@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -93,6 +94,15 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+// persistent VRAM pool serving an offloaded (host buffer) MoE expert weight tensor,
+// registered via ggml_backend_sched_register_expert_pool (see RFC #20757)
+struct llama_expert_pool {
+    ggml_tensor * pool  = nullptr; // expert slot pool on the compute backend (use as MUL_MAT_ID src[0])
+    ggml_tensor * table = nullptr; // host I32 tensor mapping expert id -> slot id (graph input)
+};
+
+using llama_expert_pools = std::unordered_map<const ggml_tensor *, llama_expert_pool>;
 
 //
 // llm_graph_input
@@ -787,6 +797,9 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // expert weight pools by original weight tensor (may be null)
+    const llama_expert_pools     * expert_pools = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1026,6 +1039,9 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // expert weight pools by original weight tensor (may be null)
+    const llama_expert_pools     * expert_pools;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

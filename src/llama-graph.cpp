@@ -1489,6 +1489,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    expert_pools     (params.expert_pools),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1547,7 +1548,35 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    // route the experts through a persistent VRAM slot pool when one is registered for this
+    // weight tensor and the ubatch cannot select more distinct experts than the pool has
+    // slots; the scheduler updates the pool and the expert id -> slot id map before each use
+    // note: expert scales and lora adapters below still index by the original expert ids
+    ggml_tensor * ids_pooled = ids;
+    ggml_tensor * w_pooled   = w;
+    if (expert_pools != nullptr) {
+        auto it = expert_pools->find(w);
+        if (it != expert_pools->end()) {
+            const llama_expert_pool & ep = it->second;
+            // cur is [n_embd, 1, n_tokens] here (see build_moe_ffn), so the number of
+            // experts a single ubatch can select is bounded by ids->ne[0] * cur->ne[2]
+            const int64_t n_max_experts = ids->ne[0] * cur->ne[2]; // n_expert_used * n_tokens
+            if (n_max_experts <= ep.pool->ne[2]) {
+                // out[i] = table[ids[i]] via get_rows on the flattened ids
+                // note: the expert ids are a strided view (argsort_top_k), make them contiguous
+                // note: the table is already [1, n_expert] (no reshape view, see
+                // ggml_backend_sched_register_expert_pool) so this GET_ROWS itself starts
+                // the pooled split and consumes the freshly uploaded table
+                ggml_tensor * table = ep.table;
+                ggml_tensor * ids_flat = ggml_cont(ctx0, ids);
+                ggml_tensor * slots = ggml_get_rows(ctx0, table, ggml_reshape_1d(ctx0, ids_flat, ids->ne[0] * ids->ne[1]));
+                ids_pooled = ggml_reshape_2d(ctx0, slots, ids->ne[0], ids->ne[1]);
+                w_pooled   = ep.pool;
+            }
+        }
+    }
+
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w_pooled, cur, ids_pooled);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
