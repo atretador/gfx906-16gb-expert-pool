@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -797,6 +801,8 @@ struct ggml_backend_sched_expert_pool {
     // running totals, reported when GGML_MOE_POOL_STATS is set
     uint64_t n_hits = 0;
     uint64_t n_misses = 0;
+    uint64_t n_evictions = 0;
+    uint64_t n_copy_bytes = 0; // expert slice bytes copied into the pool on misses
     bool report_stats = false;
     uint64_t n_reports = 0;
 
@@ -875,6 +881,9 @@ struct ggml_backend_sched {
     const ggml_tensor * expert_ids_tensor = nullptr;
     std::vector<int32_t> expert_ids_host;
     std::vector<ggml_bitset_t> expert_ids_used;
+
+    uint64_t expert_pool_generation = 0;
+    uint64_t expert_pool_next_report = 4096;
 
     int debug;
 
@@ -1715,9 +1724,15 @@ static void ggml_backend_sched_update_expert_pool(
 
 static const ggml_tensor * ggml_backend_sched_expert_pool_unwrap_ids(const ggml_tensor * ids);
 
+static void ggml_backend_sched_report_expert_pool_stats(const ggml_backend_sched_t sched, const char * reason);
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    if (!sched->expert_pools.empty()) {
+        sched->expert_pool_generation++;
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1980,6 +1995,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (!sched->expert_pools.empty() && sched->expert_pool_generation >= sched->expert_pool_next_report) {
+        constexpr uint64_t report_interval = 4096;
+        ggml_backend_sched_report_expert_pool_stats(sched, "interval");
+        sched->expert_pool_next_report = sched->expert_pool_generation > UINT64_MAX - report_interval ?
+            UINT64_MAX : sched->expert_pool_generation + report_interval;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2005,6 +2027,28 @@ static const ggml_tensor * ggml_backend_sched_expert_pool_unwrap_ids(const ggml_
         ids = ids->src[0];
     }
     return ids;
+}
+
+static void ggml_backend_sched_report_expert_pool_stats(const ggml_backend_sched_t sched, const char * reason) {
+    if (sched == nullptr || sched->expert_pools.empty()) {
+        return;
+    }
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    uint64_t copy_bytes = 0;
+    for (const auto & pool : sched->expert_pools) {
+        hits += pool.n_hits;
+        misses += pool.n_misses;
+        evictions += pool.n_evictions;
+        copy_bytes += pool.n_copy_bytes;
+    }
+    const uint64_t total = hits + misses;
+    GGML_LOG_WARN("expert pool runtime reason=%s hits=%llu misses=%llu evictions=%llu copy_bytes=%llu hit_rate=%.1f%%\n",
+            reason,
+            (unsigned long long) hits, (unsigned long long) misses,
+            (unsigned long long) evictions, (unsigned long long) copy_bytes,
+            total ? 100.0 * hits / total : 0.0);
 }
 
 // update one expert pool before the split that uses it is computed:
@@ -2101,6 +2145,7 @@ static void ggml_backend_sched_update_expert_pool(
             // the routing graph guarantees that at most n_slots distinct experts are used;
             // if this fires, a graph with more experts than slots was routed through the pool
             GGML_ASSERT(ep.slot_stamp[slot] <= stamp_base && "expert pool overflow: the ubatch uses more distinct experts than there are slots");
+            ep.n_evictions++;
             ep.expert_slot[ep.slot_expert[slot]] = -1;
         }
 
@@ -2117,6 +2162,7 @@ static void ggml_backend_sched_update_expert_pool(
             (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
             (size_t) slot * ep.expert_size,
             ep.expert_size);
+        ep.n_copy_bytes += (uint64_t) ep.expert_size;
     }
 
     // upload the rewritten table to the device copy that the remap GET_ROWS reads. the
@@ -2129,24 +2175,430 @@ static void ggml_backend_sched_update_expert_pool(
 
     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {
         ep.n_reports++;
-        GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses), %d of %d slots free\n",
+        GGML_LOG_INFO("%s: '%s' hit rate %.1f%% (%llu hits / %llu misses / %llu evictions), %d of %d slots free\n",
                 __func__, ep.w->name, 100.0 * ep.n_hits / (ep.n_hits + ep.n_misses),
-                (unsigned long long) ep.n_hits, (unsigned long long) ep.n_misses, ep.n_free, ep.n_slots);
+                (unsigned long long) ep.n_hits, (unsigned long long) ep.n_misses,
+                (unsigned long long) ep.n_evictions, ep.n_free, ep.n_slots);
     }
 }
 
-struct ggml_tensor * ggml_backend_sched_register_expert_pool(
+static bool ggml_expert_pool_checked_add(size_t a, size_t b, size_t * result) {
+    if (b > SIZE_MAX - a) {
+        return false;
+    }
+    *result = a + b;
+    return true;
+}
+
+static bool ggml_expert_pool_checked_mul(size_t a, size_t b, size_t * result) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        return false;
+    }
+    *result = a * b;
+    return true;
+}
+
+static bool ggml_expert_pool_align(size_t size, size_t alignment, size_t * result) {
+    if (alignment == 0) {
+        return false;
+    }
+    const size_t rem = size % alignment;
+    if (rem == 0) {
+        *result = size;
+        return true;
+    }
+    return ggml_expert_pool_checked_add(size, alignment - rem, result);
+}
+
+// exact device/host bytes of one pool with `slots` slots, mirroring registration:
+// payload + defensive tail, aligned, plus the aligned device map table. the host map
+// table is charged separately. returns false on any overflow.
+static bool ggml_expert_pool_slot_bytes(
+        const struct ggml_backend_expert_pool_candidate & candidate,
+        size_t slots,
+        size_t alignment,
+        size_t * device_bytes,
+        size_t * host_bytes) {
+    size_t payload = 0;
+    size_t pool_bytes = 0;
+    size_t map_bytes = 0;
+    size_t aligned_pool = 0;
+    size_t aligned_map = 0;
+    if (device_bytes == nullptr || host_bytes == nullptr ||
+        !ggml_expert_pool_checked_mul(slots, candidate.expert_size, &payload) ||
+        !ggml_expert_pool_checked_add(payload, std::min(candidate.expert_size, (size_t) 512), &pool_bytes) ||
+        !ggml_expert_pool_checked_mul(candidate.n_expert, sizeof(int32_t), &map_bytes) ||
+        !ggml_expert_pool_align(pool_bytes, alignment, &aligned_pool) ||
+        !ggml_expert_pool_align(map_bytes, alignment, &aligned_map) ||
+        !ggml_expert_pool_checked_add(aligned_pool, aligned_map, device_bytes)) {
+        return false;
+    }
+    *host_bytes = aligned_map;
+    return true;
+}
+
+static bool ggml_expert_pool_total_bytes(
+        const struct ggml_backend_expert_pool_candidate * candidates,
+        size_t n_candidates,
+        const size_t * slots,
+        size_t alignment,
+        size_t * device_bytes,
+        size_t * host_bytes) {
+    size_t device = 0;
+    size_t host = 0;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        size_t one_device = 0;
+        size_t one_host = 0;
+        if (!ggml_expert_pool_slot_bytes(candidates[i], slots[i], alignment, &one_device, &one_host) ||
+            !ggml_expert_pool_checked_add(device, one_device, &device) ||
+            !ggml_expert_pool_checked_add(host, one_host, &host)) {
+            return false;
+        }
+    }
+    *device_bytes = device;
+    *host_bytes = host;
+    return true;
+}
+
+bool ggml_backend_expert_pool_plan_uniform(
+        const struct ggml_backend_expert_pool_candidate * candidates,
+        size_t n_candidates,
+        size_t requested_slots,
+        size_t routing_width,
+        size_t budget,
+        size_t alignment,
+        struct ggml_backend_expert_pool_plan * plan) {
+    if (plan == nullptr) {
+        return false;
+    }
+    *plan = {};
+    if (candidates == nullptr || n_candidates == 0 || requested_slots == 0 || routing_width == 0 || alignment == 0) {
+        return false;
+    }
+
+    size_t max_slots = requested_slots;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        if (candidates[i].n_expert <= 1) {
+            return false;
+        }
+        max_slots = std::min(max_slots, candidates[i].n_expert - 1);
+    }
+    if (routing_width > max_slots) {
+        return false;
+    }
+
+    for (size_t slots = max_slots;; --slots) {
+        size_t device_bytes = 0;
+        size_t host_bytes = 0;
+        bool valid = true;
+        for (size_t i = 0; i < n_candidates; ++i) {
+            size_t one_device = 0;
+            size_t one_host = 0;
+            if (!ggml_expert_pool_slot_bytes(candidates[i], slots, alignment, &one_device, &one_host) ||
+                !ggml_expert_pool_checked_add(device_bytes, one_device, &device_bytes) ||
+                !ggml_expert_pool_checked_add(host_bytes, one_host, &host_bytes)) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid && device_bytes <= budget) {
+            size_t total_slots = 0;
+            if (!ggml_expert_pool_checked_mul(slots, n_candidates, &total_slots)) {
+                return false;
+            }
+            plan->enabled = true;
+            plan->n_slots = slots;
+            plan->device_bytes = device_bytes;
+            plan->host_bytes = host_bytes;
+            plan->total_slots = total_slots;
+            return true;
+        }
+        if (slots == routing_width) {
+            break;
+        }
+    }
+    return false;
+}
+
+// per-layer weighted planner. weights are a routing prior, not a safety input, so any
+// failure here just disables the pools (all-or-none, same as the uniform planner).
+bool ggml_backend_expert_pool_plan_weighted(
+        const struct ggml_backend_expert_pool_candidate * candidates,
+        size_t n_candidates,
+        size_t requested_slots,
+        size_t budget,
+        size_t alignment,
+        size_t * slots,
+        struct ggml_backend_expert_pool_plan * plan) {
+    if (plan == nullptr) {
+        return false;
+    }
+    *plan = {};
+    if (candidates == nullptr || n_candidates == 0 || requested_slots == 0 || alignment == 0 || slots == nullptr) {
+        return false;
+    }
+
+    size_t max_routing = 1;
+    bool weights_equal = true;
+    const float weight0 = candidates[0].weight;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        if (candidates[i].n_expert <= 1 || candidates[i].routing_width == 0 ||
+            !(candidates[i].weight > 0.0f) || !std::isfinite(candidates[i].weight)) {
+            return false;
+        }
+        if (candidates[i].weight != weight0) {
+            weights_equal = false;
+        }
+        max_routing = std::max(max_routing, (size_t) candidates[i].routing_width);
+    }
+
+    // no profile (or an all-equal one): keep the reviewed uniform result byte for byte.
+    // uniform requires requested >= every routing width; if a per-layer floor exceeds the
+    // request, fall through to the weighted path, which can honor per-candidate floors.
+    if (weights_equal) {
+        struct ggml_backend_expert_pool_plan uniform = {};
+        if (ggml_backend_expert_pool_plan_uniform(candidates, n_candidates, requested_slots,
+                max_routing, budget, alignment, &uniform)) {
+            for (size_t i = 0; i < n_candidates; ++i) {
+                slots[i] = uniform.n_slots;
+            }
+            *plan = uniform;
+            return true;
+        }
+    }
+
+    double weight_sum = 0.0;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        weight_sum += candidates[i].weight;
+    }
+
+    const double soft_floor = std::ceil(0.5 * (double) requested_slots);
+    const double slot_cap   = std::ceil(1.75 * (double) requested_slots);
+
+    size_t total_target = 0;
+    if (!ggml_expert_pool_checked_mul(requested_slots, n_candidates, &total_target)) {
+        return false;
+    }
+
+    std::vector<size_t> floors(n_candidates, 0);
+    std::vector<size_t> caps(n_candidates, 0);
+
+    for (size_t i = 0; i < n_candidates; ++i) {
+        const size_t floor = candidates[i].routing_width;
+        const size_t cap   = std::min(candidates[i].n_expert - 1, (size_t) slot_cap);
+        if (floor > cap) {
+            return false;
+        }
+        size_t low = std::max(floor, (size_t) soft_floor);
+        if (low > cap) {
+            low = cap;
+        }
+        floors[i] = floor;
+        caps[i]   = cap;
+
+        const double seed = std::round((double) total_target * (double) candidates[i].weight / weight_sum);
+        slots[i] = seed >= (double) cap ? cap : (seed <= (double) low ? low : (size_t) seed);
+    }
+
+    // water-fill to the total target: add to the largest weights first, remove from the
+    // smallest weights first, never crossing a per-candidate floor or cap
+    size_t sum = 0;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        if (!ggml_expert_pool_checked_add(sum, slots[i], &sum)) {
+            return false;
+        }
+    }
+    while (sum < total_target) {
+        size_t best = n_candidates;
+        for (size_t i = 0; i < n_candidates; ++i) {
+            if (slots[i] >= caps[i]) {
+                continue;
+            }
+            if (best == n_candidates || candidates[i].weight > candidates[best].weight ||
+                    (candidates[i].weight == candidates[best].weight && i < best)) {
+                best = i;
+            }
+        }
+        if (best == n_candidates) {
+            break;
+        }
+        slots[best]++;
+        sum++;
+    }
+    while (sum > total_target) {
+        size_t best = n_candidates;
+        for (size_t i = 0; i < n_candidates; ++i) {
+            if (slots[i] <= floors[i]) {
+                continue;
+            }
+            if (best == n_candidates || candidates[i].weight < candidates[best].weight ||
+                    (candidates[i].weight == candidates[best].weight && i < best)) {
+                best = i;
+            }
+        }
+        if (best == n_candidates) {
+            break;
+        }
+        slots[best]--;
+        sum--;
+    }
+
+    size_t device_bytes = 0;
+    size_t host_bytes = 0;
+    if (!ggml_expert_pool_total_bytes(candidates, n_candidates, slots, alignment, &device_bytes, &host_bytes)) {
+        return false;
+    }
+
+    // over budget: shed slots from the lowest weights first. stop at each floor; if even
+    // the floors do not fit, keep the all-or-none contract and disable the pools.
+    while (device_bytes > budget) {
+        size_t best = n_candidates;
+        for (size_t i = 0; i < n_candidates; ++i) {
+            if (slots[i] <= floors[i]) {
+                continue;
+            }
+            if (best == n_candidates || candidates[i].weight < candidates[best].weight ||
+                    (candidates[i].weight == candidates[best].weight && i < best)) {
+                best = i;
+            }
+        }
+        if (best == n_candidates) {
+            break;
+        }
+        slots[best]--;
+        if (!ggml_expert_pool_total_bytes(candidates, n_candidates, slots, alignment, &device_bytes, &host_bytes)) {
+            return false;
+        }
+    }
+    if (device_bytes > budget) {
+        return false;
+    }
+
+    size_t total_slots = 0;
+    size_t max_slots = 0;
+    for (size_t i = 0; i < n_candidates; ++i) {
+        if (!ggml_expert_pool_checked_add(total_slots, slots[i], &total_slots)) {
+            return false;
+        }
+        max_slots = std::max(max_slots, slots[i]);
+    }
+
+    plan->enabled = true;
+    plan->n_slots = max_slots;
+    plan->device_bytes = device_bytes;
+    plan->host_bytes = host_bytes;
+    plan->total_slots = total_slots;
+    return true;
+}
+
+void ggml_backend_expert_pool_profile_parse(
+        const char * name, const char * text, float * weights, size_t n_layers) {
+    if (name == nullptr || text == nullptr || weights == nullptr) {
+        return;
+    }
+    const std::string content(text);
+    size_t pos = 0;
+    size_t line_no = 0;
+    while (pos < content.size()) {
+        const size_t nl = content.find('\n', pos);
+        std::string line = content.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = nl == std::string::npos ? content.size() : nl + 1;
+        ++line_no;
+
+        const size_t begin = line.find_first_not_of(" \t\r");
+        if (begin == std::string::npos) {
+            continue;
+        }
+        line = line.substr(begin, line.find_last_not_of(" \t\r") - begin + 1);
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        if (line.rfind("blk.", 0) != 0) {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: expected 'blk.<layer> <weight>'\n", name, line_no);
+            continue;
+        }
+
+        const char * s = line.c_str() + 4;
+        char * end = nullptr;
+        errno = 0;
+        const long layer = strtol(s, &end, 10);
+        if (end == s || errno == ERANGE || layer < 0) {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: invalid layer index\n", name, line_no);
+            continue;
+        }
+        if (*end != ' ' && *end != '\t') {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: expected 'blk.<layer> <weight>'\n", name, line_no);
+            continue;
+        }
+
+        char * wend = nullptr;
+        errno = 0;
+        const float weight = strtof(end, &wend);
+        if (wend == end || errno == ERANGE || !(weight > 0.0f) || !std::isfinite(weight)) {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: weight must be a positive number\n", name, line_no);
+            continue;
+        }
+        while (*wend == ' ' || *wend == '\t') {
+            ++wend;
+        }
+        if (*wend != '\0') {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: trailing text after weight\n", name, line_no);
+            continue;
+        }
+        if ((size_t) layer >= n_layers) {
+            GGML_LOG_WARN("expert pool profile '%s': line %zu ignored: layer %ld out of range\n", name, line_no, layer);
+            continue;
+        }
+        weights[layer] = weight;
+    }
+}
+
+bool ggml_backend_expert_pool_profile_load(
+        const char * path, float * weights, size_t n_layers) {
+    if (path == nullptr || path[0] == '\0' || weights == nullptr) {
+        return false;
+    }
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        GGML_LOG_WARN("expert pool profile '%s': cannot read file; using uniform weights\n", path);
+        return false;
+    }
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    ggml_backend_expert_pool_profile_parse(path, text.c_str(), weights, n_layers);
+    return true;
+}
+
+struct ggml_tensor * ggml_backend_sched_register_expert_pool_with_reservation(
         ggml_backend_sched_t   sched,
         struct ggml_tensor   * w,
         int                    backend_id,
         int                    n_slots,
+        size_t                 device_reservation,
+        size_t               * actual_device_bytes,
+        size_t               * actual_host_bytes,
         struct ggml_tensor  ** map_table) {
+    if (map_table != nullptr) {
+        *map_table = nullptr;
+    }
     GGML_ASSERT(sched != NULL);
     GGML_ASSERT(w != NULL);
     GGML_ASSERT(w->op == GGML_OP_NONE);
     GGML_ASSERT(w->buffer != NULL && ggml_backend_buffer_is_host(w->buffer));
     GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+
+    if (w->ne[2] <= 0 || w->ne[2] > INT_MAX) {
+        GGML_LOG_ERROR("%s: expert count for '%s' is outside the supported int range\n", __func__, w->name);
+        return NULL;
+    }
+
     GGML_ASSERT(n_slots > 0 && n_slots < w->ne[2]);
+
+    if (actual_device_bytes != nullptr) {
+        *actual_device_bytes = 0;
+    }
+    if (actual_host_bytes != nullptr) {
+        *actual_host_bytes = 0;
+    }
 
     for (const auto & ep : sched->expert_pools) {
         GGML_ASSERT(ep.w != w && "expert pool already registered for this tensor");
@@ -2158,7 +2610,13 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
 
     // some kernels may read slightly past the end of the last expert (see the expert copy
     // padding in ggml_backend_sched_compute_splits), keep a defensive tail in the pool
-    const size_t pool_size = (size_t) n_slots * esz + std::min<size_t>(esz, 512);
+    size_t payload_size = 0;
+    size_t pool_size = 0;
+    if (!ggml_expert_pool_checked_mul((size_t) n_slots, esz, &payload_size) ||
+        !ggml_expert_pool_checked_add(payload_size, std::min<size_t>(esz, 512), &pool_size)) {
+        GGML_LOG_ERROR("%s: expert pool size overflow for '%s'\n", __func__, w->name);
+        return NULL;
+    }
 
     ggml_backend_buffer_t pool_buf = ggml_backend_alloc_buffer(backend, pool_size);
     if (pool_buf == NULL) {
@@ -2182,6 +2640,22 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
         ggml_backend_buffer_free(table_buf);
         ggml_backend_buffer_free(pool_buf);
         GGML_LOG_ERROR("%s: failed to allocate the device map table for '%s'\n", __func__, w->name);
+        return NULL;
+    }
+
+    const size_t actual_pool_bytes = ggml_backend_buffer_get_size(pool_buf);
+    const size_t actual_table_bytes = ggml_backend_buffer_get_size(table_buf);
+    const size_t actual_table_dev_bytes = ggml_backend_buffer_get_size(table_dev_buf);
+    size_t actual_device = 0;
+    const size_t map_bytes = (size_t) n_expert * sizeof(int32_t);
+    if (actual_pool_bytes < pool_size || actual_table_bytes < map_bytes || actual_table_dev_bytes < map_bytes ||
+        !ggml_expert_pool_checked_add(actual_pool_bytes, actual_table_dev_bytes, &actual_device) ||
+        actual_device > device_reservation) {
+        GGML_LOG_ERROR("%s: backend allocation reservation rejected for '%s' (reserved=%zu actual=%zu)\n",
+                __func__, w->name, device_reservation, actual_device);
+        ggml_backend_buffer_free(table_dev_buf);
+        ggml_backend_buffer_free(table_buf);
+        ggml_backend_buffer_free(pool_buf);
         return NULL;
     }
 
@@ -2261,18 +2735,59 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool(
     GGML_LOG_INFO("%s: expert pool for '%s' on %s: %d/%d experts (%.2f MiB)\n", __func__,
             w->name, ggml_backend_name(backend), n_slots, n_expert, pool_size / 1024.0 / 1024.0);
 
+    if (actual_device_bytes != nullptr) {
+        *actual_device_bytes = actual_device;
+    }
+    if (actual_host_bytes != nullptr) {
+        *actual_host_bytes = actual_table_bytes;
+    }
+
     return pool;
+}
+
+struct ggml_tensor * ggml_backend_sched_register_expert_pool(
+        ggml_backend_sched_t   sched,
+        struct ggml_tensor   * w,
+        int                    backend_id,
+        int                    n_slots,
+        struct ggml_tensor  ** map_table) {
+    return ggml_backend_sched_register_expert_pool_with_reservation(
+            sched, w, backend_id, n_slots, SIZE_MAX, nullptr, nullptr, map_table);
+}
+
+void ggml_backend_sched_clear_expert_pools(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return;
+    }
+    for (auto & ep : sched->expert_pools) {
+        ggml_backend_buffer_free(ep.pool_buf);
+        ggml_backend_buffer_free(ep.table_buf);
+        ggml_backend_buffer_free(ep.table_dev_buf);
+    }
+    sched->expert_pools.clear();
+    sched->expert_pool_by_buf.clear();
+    sched->expert_ids_tensor = nullptr;
+    sched->expert_ids_host.clear();
+    sched->expert_ids_used.clear();
+    if (sched->ctx_pools != nullptr) {
+        ggml_free(sched->ctx_pools);
+        sched->ctx_pools = nullptr;
+    }
 }
 
 void ggml_backend_sched_get_expert_pool_stats(
         const ggml_backend_sched_t sched,
         long long * hits,
-        long long * misses) {
+        long long * misses,
+        long long * copy_bytes) {
     if (hits != NULL) {
         *hits = 0;
     }
     if (misses != NULL) {
         *misses = 0;
+    }
+    if (copy_bytes != NULL) {
+        *copy_bytes = 0;
     }
     if (sched == NULL) {
         return;
@@ -2283,6 +2798,9 @@ void ggml_backend_sched_get_expert_pool_stats(
         }
         if (misses != NULL) {
             *misses += (long long) ep.n_misses;
+        }
+        if (copy_bytes != NULL) {
+            *copy_bytes += (long long) ep.n_copy_bytes;
         }
     }
 }
@@ -2365,14 +2883,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    for (auto & ep : sched->expert_pools) {
-        ggml_backend_buffer_free(ep.pool_buf);
-        ggml_backend_buffer_free(ep.table_buf);
-        ggml_backend_buffer_free(ep.table_dev_buf);
-    }
-    if (sched->ctx_pools != NULL) {
-        ggml_free(sched->ctx_pools);
-    }
+    ggml_backend_sched_report_expert_pool_stats(sched, "shutdown");
+    ggml_backend_sched_clear_expert_pools(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

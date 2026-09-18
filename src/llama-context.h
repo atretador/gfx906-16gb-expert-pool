@@ -293,6 +293,9 @@ private:
 
     // expert weight pools by original weight tensor, filled by init_expert_pools()
     llama_expert_pools expert_pools;
+    std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state =
+        std::make_shared<llama_expert_pool_diagnostic_state>();
+    bool expert_pool_status_reported = false;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

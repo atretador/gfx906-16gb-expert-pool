@@ -378,13 +378,75 @@ extern "C" {
         int                    n_slots,
         struct ggml_tensor  ** map_table);
 
+    GGML_API struct ggml_tensor * ggml_backend_sched_register_expert_pool_with_reservation(
+         ggml_backend_sched_t   sched,
+         struct ggml_tensor   * w,
+         int                    backend_id,
+         int                    n_slots,
+         size_t                 device_reservation,
+         size_t               * actual_device_bytes,
+         size_t               * actual_host_bytes,
+         struct ggml_tensor  ** map_table);
+
+    GGML_API void ggml_backend_sched_clear_expert_pools(ggml_backend_sched_t sched);
+
+    struct ggml_backend_expert_pool_candidate {
+        size_t   n_expert;
+        size_t   expert_size;
+        uint32_t routing_width; // floor for the weighted planner: S_i >= routing_width
+        float    weight;        // per-layer routing prior, 1.0 means no profile
+    };
+
+    struct ggml_backend_expert_pool_plan {
+        bool enabled;
+        size_t n_slots;      // uniform count, or the largest per-pool count when weighted
+        size_t device_bytes;
+        size_t host_bytes;
+        size_t total_slots;  // sum of the per-candidate slot counts
+    };
+
+    GGML_API bool ggml_backend_expert_pool_plan_uniform(
+         const struct ggml_backend_expert_pool_candidate * candidates,
+         size_t n_candidates,
+         size_t requested_slots,
+         size_t routing_width,
+         size_t budget,
+         size_t alignment,
+         struct ggml_backend_expert_pool_plan * plan);
+
+    // per-layer traffic-aware planner: distributes `requested_slots * n_candidates` total
+    // slots over the candidates by weight, clamped to [routing_width, min(n_expert - 1,
+    // ceil(1.75 * requested_slots))]. `slots` receives one count per candidate. when the
+    // uniform plan fits, equal weights reproduce ggml_backend_expert_pool_plan_uniform
+    // byte for byte. returns false (and leaves `plan` disabled) when no legal distribution
+    // fits the byte budget.
+    GGML_API bool ggml_backend_expert_pool_plan_weighted(
+         const struct ggml_backend_expert_pool_candidate * candidates,
+         size_t n_candidates,
+         size_t requested_slots,
+         size_t budget,
+         size_t alignment,
+         size_t * slots,
+         struct ggml_backend_expert_pool_plan * plan);
+
+    // per-layer routing prior loaded from a text profile (LLAMA_MOE_POOL_PROFILE).
+    // `parse` reads "blk.<layer> <weight>" lines; malformed and non-positive entries are
+    // warned and left at their previous value. `load` fills `weights` (which the caller
+    // initialized to 1.0) and returns false only if the file cannot be read.
+    GGML_API void ggml_backend_expert_pool_profile_parse(
+         const char * name, const char * text, float * weights, size_t n_layers);
+
+    GGML_API bool ggml_backend_expert_pool_profile_load(
+         const char * path, float * weights, size_t n_layers);
+
     // total expert-pool cache events over the lifetime of the scheduler, summed over all
     // pools; the same counters behind the GGML_MOE_POOL_STATS log lines. exposed so tests
     // and tooling can verify the hit-rate telemetry without parsing logs
     GGML_API void ggml_backend_sched_get_expert_pool_stats(
         const ggml_backend_sched_t sched,
-        long long * hits,   // may be NULL
-        long long * misses); // may be NULL
+        long long * hits,       // may be NULL
+        long long * misses,     // may be NULL
+        long long * copy_bytes); // may be NULL; bytes of expert slices copied on misses
 
     //
     // Meta backend
