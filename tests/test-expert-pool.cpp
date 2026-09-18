@@ -17,10 +17,177 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "../common/common.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
+
+static bool test_uniform_planner() {
+    const size_t alignment = 64;
+    const struct ggml_backend_expert_pool_candidate one[] = {{ 8, 100, 0, 1.0f }};
+    struct ggml_backend_expert_pool_plan plan = {};
+
+    bool ok = ggml_backend_expert_pool_plan_uniform(one, 1, 4, 4, 576, alignment, &plan) &&
+        plan.enabled && plan.n_slots == 4 && plan.device_bytes == 576 && plan.host_bytes == 64;
+    ok &= !ggml_backend_expert_pool_plan_uniform(one, 1, 4, 4, 575, alignment, &plan);
+    ok &= !ggml_backend_expert_pool_plan_uniform(one, 1, 4, 5, 576, alignment, &plan);
+
+    const struct ggml_backend_expert_pool_candidate ordered[] = {{ 8, 200, 0, 1.0f }, { 5, 100, 0, 1.0f }};
+    const struct ggml_backend_expert_pool_candidate reversed[] = {{ 5, 100, 0, 1.0f }, { 8, 200, 0, 1.0f }};
+    struct ggml_backend_expert_pool_plan ordered_plan = {};
+    struct ggml_backend_expert_pool_plan reversed_plan = {};
+    ok &= ggml_backend_expert_pool_plan_uniform(ordered, 2, 6, 2, 4096, alignment, &ordered_plan);
+    ok &= ggml_backend_expert_pool_plan_uniform(reversed, 2, 6, 2, 4096, alignment, &reversed_plan);
+    ok &= ordered_plan.enabled && ordered_plan.n_slots == 4 &&
+        ordered_plan.device_bytes == reversed_plan.device_bytes &&
+        ordered_plan.host_bytes == reversed_plan.host_bytes;
+
+    const struct ggml_backend_expert_pool_candidate overflow[] = {{ 2, std::numeric_limits<size_t>::max(), 0, 1.0f }};
+    ok &= !ggml_backend_expert_pool_plan_uniform(overflow, 1, 2, 1, std::numeric_limits<size_t>::max(), alignment, &plan);
+    ok &= !ggml_backend_expert_pool_plan_uniform(one, 1, 4, 1, 576, 0, &plan);
+
+    // an uncapped (SIZE_MAX) budget admits the requested slot count up to
+    // n_expert - 1; a reduced budget admits fewer
+    ok &= ggml_backend_expert_pool_plan_uniform(one, 1, 7, 4, std::numeric_limits<size_t>::max(), alignment, &plan) &&
+        plan.enabled && plan.n_slots == 7;
+    ok &= ggml_backend_expert_pool_plan_uniform(one, 1, 9, 4, std::numeric_limits<size_t>::max(), alignment, &plan) &&
+        plan.enabled && plan.n_slots == 7;
+    ok &= ggml_backend_expert_pool_plan_uniform(one, 1, 7, 4, 576, alignment, &plan) &&
+        plan.enabled && plan.n_slots == 4;
+    printf("uniform planner: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+// (a) equal weights must reproduce the uniform plan byte for byte, with and without
+// budget pressure; (b) weighted weights must hit the total target and stay inside the
+// per-candidate floor/cap rails
+static bool test_weighted_planner() {
+    const size_t alignment = 64;
+    const struct ggml_backend_expert_pool_candidate equal[] = {
+        { 8, 100, 2, 1.0f }, { 8, 200, 2, 1.0f }, { 5, 100, 2, 1.0f },
+    };
+    size_t slots[4] = {};
+    struct ggml_backend_expert_pool_plan uniform = {};
+    struct ggml_backend_expert_pool_plan weighted = {};
+
+    bool ok = ggml_backend_expert_pool_plan_uniform(equal, 3, 4, 2, 4096, alignment, &uniform) &&
+        ggml_backend_expert_pool_plan_weighted(equal, 3, 4, 4096, alignment, slots, &weighted) &&
+        weighted.enabled && uniform.enabled;
+    for (size_t i = 0; i < 3; ++i) {
+        ok &= slots[i] == uniform.n_slots;
+    }
+    ok &= weighted.device_bytes == uniform.device_bytes && weighted.host_bytes == uniform.host_bytes &&
+        weighted.total_slots == uniform.total_slots;
+
+    // budget pressure: the equal-weight path must still mirror the uniform reduction
+    uniform = {};
+    weighted = {};
+    ok &= ggml_backend_expert_pool_plan_uniform(equal, 3, 6, 2, 2048, alignment, &uniform) &&
+        ggml_backend_expert_pool_plan_weighted(equal, 3, 6, 2048, alignment, slots, &weighted) &&
+        weighted.enabled && uniform.enabled;
+    for (size_t i = 0; i < 3; ++i) {
+        ok &= slots[i] == uniform.n_slots;
+    }
+
+    // weighted: heavier layers get more slots, total target is exact, bounds hold
+    const struct ggml_backend_expert_pool_candidate skewed[] = {
+        { 16, 100, 1, 4.0f }, { 16, 100, 1, 3.0f }, { 16, 100, 1, 2.0f }, { 16, 100, 1, 1.0f },
+    };
+    weighted = {};
+    ok &= ggml_backend_expert_pool_plan_weighted(skewed, 4, 4, std::numeric_limits<size_t>::max(), alignment, slots, &weighted) &&
+        weighted.enabled;
+    size_t sum = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        sum += slots[i];
+        ok &= slots[i] >= 1 && slots[i] <= 7; // floor = routing_width, cap = ceil(1.75 * 4)
+    }
+    ok &= sum == weighted.total_slots && sum == 16; // requested_slots * n_candidates
+    ok &= slots[0] >= slots[1] && slots[1] >= slots[2] && slots[2] >= slots[3];
+
+    // floor: a wide routing layer must keep at least its routing width
+    const struct ggml_backend_expert_pool_candidate floored[] = {
+        { 16, 100, 5, 1.0f }, { 16, 100, 1, 1.0f }, { 16, 100, 1, 1.0f }, { 16, 100, 1, 1.0f },
+    };
+    weighted = {};
+    ok &= ggml_backend_expert_pool_plan_weighted(floored, 4, 4, std::numeric_limits<size_t>::max(), alignment, slots, &weighted) &&
+        weighted.enabled && slots[0] >= 5;
+    sum = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        sum += slots[i];
+    }
+    ok &= sum == 16;
+
+    // cap: one dominant weight is clamped, the rest absorb the remaining target
+    const struct ggml_backend_expert_pool_candidate dominant[] = {
+        { 16, 100, 1, 100.0f }, { 16, 100, 1, 1.0f }, { 16, 100, 1, 1.0f }, { 16, 100, 1, 1.0f },
+    };
+    weighted = {};
+    ok &= ggml_backend_expert_pool_plan_weighted(dominant, 4, 4, std::numeric_limits<size_t>::max(), alignment, slots, &weighted) &&
+        weighted.enabled && slots[0] == 7;
+    sum = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        sum += slots[i];
+    }
+    ok &= sum == 16;
+
+    printf("weighted planner: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+static bool test_profile_parser() {
+    float weights[4];
+    bool ok = true;
+
+    auto reset = [&]() {
+        for (float & w : weights) {
+            w = 1.0f;
+        }
+    };
+
+    reset();
+    const char * text =
+        "# per-layer routing prior\n"
+        "\n"
+        "blk.0 1.25\n"
+        "blk.1 0\n"
+        "blk.2 -2.5\n"
+        "blk.3 2\n"
+        "blk.3 0.5 trailing\n"
+        "blk.x 1\n"
+        "blk. 4\n"
+        "blk.9 3\n";
+    ggml_backend_expert_pool_profile_parse("test.profile", text, weights, 4);
+    ok &= weights[0] == 1.25f && weights[1] == 1.0f && weights[2] == 1.0f && weights[3] == 2.0f;
+
+    reset();
+    ok &= !ggml_backend_expert_pool_profile_load("/nonexistent/mi50-128k-test.profile", weights, 4);
+    ok &= weights[0] == 1.0f && weights[1] == 1.0f && weights[2] == 1.0f && weights[3] == 1.0f;
+
+    printf("profile parser: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+static bool test_mtp_parameter_guard() {
+    common_params params;
+    params.expert_cache_slots = 64;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+
+    const llama_context_params mtp = common_context_params_to_llama(params);
+    common_params draft_params = params;
+    draft_params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+    draft_params.speculative.draft.mparams.path = "draft.gguf";
+    llama_context_params draft = common_context_params_to_llama(draft_params);
+    common_params regular_params;
+    regular_params.expert_cache_slots = 64;
+    const llama_context_params regular = common_context_params_to_llama(regular_params);
+    const bool ok = mtp.expert_cache_slots == 0 && draft.expert_cache_slots == 0 &&
+        regular.expert_cache_slots == 64;
+    printf("MTP parameter guard: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
 
 // per-case geometry (n_in must be a multiple of the largest quant block size)
 // n_tokens goes up to 9: n_tokens > MMVQ_MAX_BATCH_SIZE (8) is what forces the CUDA MMQ
@@ -246,8 +413,177 @@ static bool run_round(ggml_backend_sched_t sched, ggml_context * ctx,
     return ok;
 }
 
+// informational, never fails: compares the same MUL_MAT_ID computed on the CPU backend
+// and on the accelerator with identical weight and id bytes. the two backends quantize
+// the activations differently (Q8_K vs Q8_1) and reduce in a different order, so a
+// mismatch is expected and is not a pool defect - it sizes the drift between a cache-off
+// (CPU MoE) and a cache-on (accelerator MoE) comparison, which the pooled parity rounds
+// above cannot show because both of their sides run on the accelerator.
+static void probe_cpu_vs_accel(ggml_type type, ggml_tensor * w_cpu, ggml_tensor * x_cpu,
+        ggml_backend_sched_t sched_accel, ggml_backend_buffer_type_t accel_buft,
+        ggml_backend_buffer_type_t cpu_buft) {
+    const int nt = 3;
+    const std::vector<int32_t> ids_data = { 0, 1, 2, 1, 3, 0 };
+
+    ggml_init_params ip = { 32 * ggml_tensor_overhead() + 8 * ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    ggml_tensor * ids_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+    ids_cpu->buffer = ggml_backend_buft_alloc_buffer(cpu_buft, ggml_nbytes(ids_cpu));
+    ids_cpu->data = ggml_backend_buffer_get_base(ids_cpu->buffer);
+    ggml_backend_tensor_set(ids_cpu, ids_data.data(), 0, ggml_nbytes(ids_cpu));
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t cpu_backends[] = { cpu };
+    ggml_backend_buffer_type_t cpu_bufts[] = { cpu_buft };
+    ggml_backend_sched_t sched_cpu = ggml_backend_sched_new(cpu_backends, cpu_bufts, 1, 4096, false, false);
+
+    ggml_tensor * x3_cpu = ggml_reshape_3d(ctx,
+            ggml_view_2d(ctx, x_cpu, n_in, nt, x_cpu->nb[1], 0), n_in, 1, nt);
+    ggml_tensor * out_cpu = ggml_mul_mat_id(ctx, w_cpu, x3_cpu,
+            ggml_view_2d(ctx, ids_cpu, n_used, nt, ids_cpu->nb[1], 0));
+    ggml_cgraph * gf_cpu = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf_cpu, out_cpu);
+    ggml_backend_sched_reset(sched_cpu);
+    if (ggml_backend_sched_graph_compute(sched_cpu, gf_cpu) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "cpu-vs-accel probe %s: cpu compute failed\n", ggml_type_name(type));
+        ggml_backend_sched_free(sched_cpu);
+        ggml_backend_free(cpu);
+        ggml_free(ctx);
+        return;
+    }
+
+    ggml_tensor * w_gpu = ggml_new_tensor_3d(ctx, type, n_in, n_out, n_expert);
+    ggml_tensor * x_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, nt);
+    ggml_tensor * ids_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, nt);
+    for (ggml_tensor * t : { w_gpu, x_gpu, ids_gpu }) {
+        t->buffer = ggml_backend_buft_alloc_buffer(accel_buft, ggml_nbytes(t));
+        t->data = ggml_backend_buffer_get_base(t->buffer);
+    }
+    ggml_backend_tensor_set(w_gpu, w_cpu->data, 0, ggml_nbytes(w_gpu));
+    ggml_backend_tensor_set(x_gpu, x_cpu->data, 0, ggml_nbytes(x_gpu));
+    ggml_backend_tensor_set(ids_gpu, ids_data.data(), 0, ggml_nbytes(ids_gpu));
+
+    ggml_tensor * x3_gpu = ggml_reshape_3d(ctx,
+            ggml_view_2d(ctx, x_gpu, n_in, nt, x_gpu->nb[1], 0), n_in, 1, nt);
+    ggml_tensor * out_gpu = ggml_mul_mat_id(ctx, w_gpu, x3_gpu,
+            ggml_view_2d(ctx, ids_gpu, n_used, nt, ids_gpu->nb[1], 0));
+    ggml_cgraph * gf_gpu = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf_gpu, out_gpu);
+    ggml_backend_sched_reset(sched_accel);
+    if (ggml_backend_sched_graph_compute(sched_accel, gf_gpu) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "cpu-vs-accel probe %s: accel compute failed\n", ggml_type_name(type));
+        ggml_backend_sched_free(sched_cpu);
+        ggml_backend_free(cpu);
+        ggml_free(ctx);
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(out_cpu);
+    std::vector<float> a(nbytes / sizeof(float)), b(nbytes / sizeof(float));
+    ggml_backend_tensor_get(out_cpu, a.data(), 0, nbytes);
+    ggml_backend_tensor_get(out_gpu, b.data(), 0, nbytes);
+
+    size_t n_diff = 0;
+    double max_abs = 0.0, max_rel = 0.0;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] != b[i]) {
+            n_diff++;
+            const double d = std::fabs((double) a[i] - (double) b[i]);
+            const double r = d / (std::fabs((double) a[i]) + 1e-6);
+            max_abs = d > max_abs ? d : max_abs;
+            max_rel = r > max_rel ? r : max_rel;
+        }
+    }
+    if (n_diff == 0) {
+        printf("  cpu-vs-accel %s: bit-exact\n", ggml_type_name(type));
+    } else {
+        printf("  cpu-vs-accel %s: %zu/%zu differ, max_abs=%.3e max_rel=%.3e\n",
+            ggml_type_name(type), n_diff, a.size(), max_abs, max_rel);
+    }
+
+    ggml_backend_sched_free(sched_cpu);
+    ggml_backend_free(cpu);
+    ggml_free(ctx);
+}
+
+// (d) two pools with DIFFERENT slot counts sharing one routing must both stay bit-exact
+// versus the host-copy reference. the small pool thrashes where the large one does not,
+// which is the shape the weighted per-layer planner produces
+static bool test_mixed_slot_pools(ggml_backend_t accel, ggml_backend_buffer_type_t accel_buft) {
+    const int n_slots_big   = 8;
+    const int n_slots_small = 4;
+
+    ggml_backend_t backends[] = { accel, ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
+    ggml_backend_buffer_type_t bufts[] = { accel_buft, ggml_backend_get_default_buffer_type(backends[1]) };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 4096, false, true);
+
+    ggml_init_params ip = { 32 * ggml_tensor_overhead(), NULL, true };
+    ggml_context * tctx = ggml_init(ip);
+    tensors ts;
+    const int64_t ne_w[3] = { n_in, n_out, n_expert };
+    std::vector<float> w_data((size_t) n_out * n_in * n_expert);
+    for (int e = 0; e < n_expert; e++) {
+        for (size_t i = 0; i < (size_t) n_out * n_in; i++) {
+            w_data[(size_t) e * n_out * n_in + i] = float((i * 1103515245u + 12345u) >> 16) / 4096.0f - 8.0f + 0.5f * e;
+        }
+    }
+    std::vector<float> x_data((size_t) n_in * n_tokens_max);
+    for (size_t i = 0; i < x_data.size(); i++) {
+        x_data[i] = float((i * 214013u + 2531011u) >> 16) / 8192.0f - 4.0f;
+    }
+
+    ts.w_gu = make_quant_host_tensor(tctx, bufts[1], GGML_TYPE_Q8_0, ne_w, w_data, "w_gu");
+    ts.w_dn = make_quant_host_tensor(tctx, bufts[1], GGML_TYPE_Q8_0, ne_w, w_data, "w_dn");
+    const int64_t ne_x[2] = { n_in, n_tokens_max };
+    ts.x = make_host_tensor(tctx, bufts[1], GGML_TYPE_F32, ne_x, 2, x_data, true, "x");
+    make_strided_ids(tctx, ts, accel);
+
+    ts.pool_gu = ggml_backend_sched_register_expert_pool(sched, ts.w_gu, 0, n_slots_big,   &ts.table_gu);
+    ts.pool_dn = ggml_backend_sched_register_expert_pool(sched, ts.w_dn, 0, n_slots_small, &ts.table_dn);
+    if (!ts.pool_gu || !ts.pool_dn) {
+        fprintf(stderr, "mixed-slot pools: registration failed\n");
+        ggml_free(tctx);
+        ggml_backend_free(backends[1]);
+        ggml_backend_sched_free(sched);
+        return false;
+    }
+
+    bool ok = true;
+    for (int n_tokens : { 1, 2 }) {
+        ggml_init_params gp = { 64 * ggml_tensor_overhead() + 8 * ggml_graph_overhead(), NULL, true };
+        ggml_context * gctx = ggml_init(gp);
+        char label[128];
+        // at most n_slots_small distinct experts per ubatch so both pools can hold the batch
+        for (int r = 0; r < 3; r++) {
+            const std::vector<int32_t> ids = (r % 2 == 0) ?
+                std::vector<int32_t>{ 0, 1, 2, 3, 1, 0 } : std::vector<int32_t>{ 4, 5, 6, 7, 5, 4 };
+            snprintf(label, sizeof(label), "mixed-slot nt=%d round%d", n_tokens, r);
+            ok &= run_round(sched, gctx, ts, n_tokens, ids, label);
+        }
+        ggml_free(gctx);
+    }
+
+    ggml_free(tctx);
+    ggml_backend_free(backends[1]);
+    ggml_backend_sched_free(sched);
+    return ok;
+}
+
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (!test_uniform_planner()) {
+        return 1;
+    }
+    if (!test_weighted_planner()) {
+        return 1;
+    }
+    if (!test_profile_parser()) {
+        return 1;
+    }
+    if (!test_mtp_parameter_guard()) {
+        return 1;
+    }
     // find an accelerator backend to host the pool
     ggml_backend_dev_t accel_dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -270,7 +606,7 @@ int main() {
     }
     printf("accelerator: %s\n", ggml_backend_name(accel));
 
-    const ggml_type types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4 };
+    const ggml_type types[] = { GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_IQ4_XS };
 
     // deterministic pseudo-random weights and activations; the weights differ per expert
     // so that a wrong id -> slot mapping surfaces as a bit-exact mismatch - identical
@@ -307,6 +643,18 @@ int main() {
         ts.x = make_host_tensor(tctx, bufts[1], GGML_TYPE_F32, ne_x, 2, x_data, true, "x");
         make_strided_ids(tctx, ts, accel);
 
+        probe_cpu_vs_accel(type, ts.w_gu, ts.x, sched, bufts[0], bufts[1]);
+
+        size_t rejected_device = 0;
+        size_t rejected_host = 0;
+        ggml_tensor * rejected_table = nullptr;
+        if (ggml_backend_sched_register_expert_pool_with_reservation(sched, ts.w_gu, 0, n_slots, 0,
+                &rejected_device, &rejected_host, &rejected_table) != nullptr ||
+            rejected_device != 0 || rejected_host != 0 || rejected_table != nullptr) {
+            fprintf(stderr, "reservation rollback failed for %s\n", ggml_type_name(type));
+            return 1;
+        }
+
         ts.pool_gu = ggml_backend_sched_register_expert_pool(sched, ts.w_gu, 0, n_slots, &ts.table_gu);
         ts.pool_dn = ggml_backend_sched_register_expert_pool(sched, ts.w_dn, 0, n_slots, &ts.table_dn);
         if (!ts.pool_gu || !ts.pool_dn) {
@@ -319,13 +667,19 @@ int main() {
         // routing, so the sched totals must be exactly twice the single-pool model
         stats_model model(n_expert, n_slots);
         auto check_stats = [&](const char * label, bool & ok) {
-            long long hits = -1, misses = -1;
-            ggml_backend_sched_get_expert_pool_stats(sched, &hits, &misses);
+            long long hits = -1, misses = -1, copy_bytes = -1;
+            ggml_backend_sched_get_expert_pool_stats(sched, &hits, &misses, &copy_bytes);
             const long long exp_hits = 2 * model.hits;
             const long long exp_misses = 2 * model.misses;
+            const long long exp_copy_bytes = 2 * model.misses * (long long) ts.w_gu->nb[2];
             if (hits != exp_hits || misses != exp_misses) {
                 fprintf(stderr, "%s: hit-rate telemetry mismatch: sched reports hits=%lld misses=%lld,"
                         " expected hits=%lld misses=%lld\n", label, hits, misses, exp_hits, exp_misses);
+                ok = false;
+            }
+            if (copy_bytes != exp_copy_bytes) {
+                fprintf(stderr, "%s: copy_bytes mismatch: sched reports %lld, expected %lld\n",
+                        label, copy_bytes, exp_copy_bytes);
                 ok = false;
             }
         };
@@ -390,6 +744,10 @@ int main() {
         ggml_free(tctx);
         ggml_backend_free(backends[1]);
         ggml_backend_sched_free(sched);
+    }
+
+    if (!test_mixed_slot_pools(accel, accel_buft)) {
+        n_failed++;
     }
 
     ggml_backend_free(accel);

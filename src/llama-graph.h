@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <set>
@@ -94,6 +95,10 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+
+struct llama_expert_pool_diagnostic_state {
+    std::atomic<bool> first_use_reported = false;
+};
 
 // persistent VRAM pool serving an offloaded (host buffer) MoE expert weight tensor,
 // registered via ggml_backend_sched_register_expert_pool (see RFC #20757)
@@ -799,6 +804,7 @@ struct llm_graph_params {
 
     // expert weight pools by original weight tensor (may be null)
     const llama_expert_pools     * expert_pools = nullptr;
+    std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1042,6 +1048,7 @@ struct llm_graph_context {
 
     // expert weight pools by original weight tensor (may be null)
     const llama_expert_pools     * expert_pools;
+    std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

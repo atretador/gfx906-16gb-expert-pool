@@ -14,11 +14,15 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 //
@@ -586,9 +590,109 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 }
 
 void llama_context::init_expert_pools() {
+    ggml_backend_sched_clear_expert_pools(sched.get());
     expert_pools.clear();
 
+    constexpr size_t MiB = 1024ull * 1024;
+
+    size_t rail_mib = 0;
+    size_t cap_mib  = 0;
+
+    const char * cap_text = std::getenv("LLAMA_MOE_POOL_CAP_MIB");
+    const bool cap_set = cap_text != nullptr && cap_text[0] != '\0';
+
+    auto read_pool_limit = [](const char * name, size_t def, bool optional, size_t & out) -> bool {
+        const char * text = std::getenv(name);
+        if (text == nullptr) {
+            out = def;
+            return true;
+        }
+        if (text[0] == '\0') {
+            if (optional) {
+                out = def;
+                return true;
+            }
+            LLAMA_LOG_WARN("expert pool limit rejected: %s='%s' is not a valid MiB value\n", name, text);
+            return false;
+        }
+        bool digits = true;
+        for (const char * p = text; *p != '\0'; ++p) {
+            digits = digits && *p >= '0' && *p <= '9';
+        }
+        errno = 0;
+        char * end = nullptr;
+        const unsigned long long value = digits ? std::strtoull(text, &end, 10) : 0;
+        // reject non-decimal, trailing garbage, overflow, and absurd values
+        if (!digits || end == text || *end != '\0' || errno == ERANGE ||
+                value > std::numeric_limits<size_t>::max() / MiB || value > 65536) {
+            LLAMA_LOG_WARN("expert pool limit rejected: %s='%s' is not a valid MiB value\n", name, text);
+            return false;
+        }
+        out = (size_t) value;
+        return true;
+    };
+
+    bool limits_valid =
+        read_pool_limit("LLAMA_MOE_POOL_CAP_MIB",  0,    true,  cap_mib) &&
+        read_pool_limit("LLAMA_MOE_POOL_RAIL_MIB", 2879, false, rail_mib);
+
+    if (limits_valid && cap_set && cap_mib == 0) {
+        LLAMA_LOG_WARN("expert pool limit rejected: LLAMA_MOE_POOL_CAP_MIB='0' would disable every pool; use --moe-expert-cache 0 instead\n");
+        limits_valid = false;
+    }
+    if (limits_valid && rail_mib < 1024) {
+        // keep the reviewed invariant: never hold less than 1 GiB free
+        LLAMA_LOG_WARN("expert pool limit clamped: LLAMA_MOE_POOL_RAIL_MIB=%zu MiB is below the 1024 MiB floor; using 1024\n", rail_mib);
+        rail_mib = 1024;
+    }
+
+    const size_t rail_bytes = rail_mib * MiB;
+    // a supplied cap bounds the budget; without one the rail-derived slack is the only bound
+    const size_t pool_cap   = cap_set ? cap_mib * MiB : 0;
+    const size_t pool_bound = cap_set ? pool_cap : std::numeric_limits<size_t>::max();
+
+    size_t ceiling = 0;
+
+    // optional per-layer routing prior. the available per-layer skew comes from a single
+    // short run, so it stays an explicit swappable file instead of a built-in table.
+    std::vector<float> profile_weights(model.layers.size(), 1.0f);
+    const char * profile_state = "none";
+    const char * profile_path = std::getenv("LLAMA_MOE_POOL_PROFILE");
+    if (profile_path != nullptr && profile_path[0] != '\0') {
+        if (ggml_backend_expert_pool_profile_load(profile_path, profile_weights.data(), profile_weights.size())) {
+            profile_state = "file";
+        }
+    }
+    const char * alloc_kind = strcmp(profile_state, "file") == 0 ? "weighted" : "uniform";
+    size_t slots_min = 0;
+    size_t slots_med = 0;
+    size_t slots_max = 0;
+    size_t total_slots = 0;
+
+    auto report_status = [&](const char * status, const char * reason, size_t actual_slots,
+            size_t pool_count, size_t bytes, size_t cap, const char * limited_by) {
+        if (expert_pool_status_reported) {
+            return;
+        }
+        expert_pool_status_reported = true;
+        LLAMA_LOG_WARN("expert pool status=%s reason=%s requested_slots=%d actual_slots=%zu pool_count=%zu bytes=%zu cap=%zu ceiling=%zu limited_by=%s alloc=%s profile=%s slots_min=%zu slots_med=%zu slots_max=%zu total_slots=%zu\n",
+                status, reason, cparams.expert_cache_slots, actual_slots, pool_count, bytes, cap, ceiling, limited_by,
+                alloc_kind, profile_state, slots_min, slots_med, slots_max, total_slots);
+    };
+
+    if (!limits_valid) {
+        report_status("disabled", "invalid-pool-limit", 0, 0, 0, 0, "none");
+        return;
+    }
+
     if (cparams.expert_cache_slots <= 0) {
+        report_status("disabled", "slots-disabled", 0, 0, 0, pool_cap, "none");
+        return;
+    }
+
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.ctx_other != nullptr) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: MTP contexts and MTP-linked target contexts do not own pools\n", __func__);
+        report_status("disabled", "mtp-context", 0, 0, 0, pool_cap, "none");
         return;
     }
 
@@ -596,6 +700,7 @@ void llama_context::init_expert_pools() {
         // the pool slots are overwritten in stream order; with pipeline parallelism a
         // previous computation may still be reading the pool when the next one updates it
         LLAMA_LOG_WARN("%s: expert cache disabled: not supported with pipeline parallelism\n", __func__);
+        report_status("disabled", "pipeline-parallel", 0, 0, 0, pool_cap, "none");
         return;
     }
 
@@ -611,6 +716,7 @@ void llama_context::init_expert_pools() {
             // others - the pooled FFNs would either migrate devices or copy the pool
             // cross-device every step. untested and likely slower than the stock path.
             LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports exactly one\n", __func__, n_accel);
+            report_status("disabled", "multiple-accelerators", 0, 0, 0, pool_cap, "none");
             return;
         }
     }
@@ -627,49 +733,54 @@ void llama_context::init_expert_pools() {
     }
     if (backend_id < 0) {
         LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
+        report_status("disabled", "no-accelerator", 0, 0, 0, pool_cap, "none");
         return;
     }
 
-    int n_pooled = 0;
-    int n_skipped = 0;
+    constexpr size_t future_reserve = 180158464ull; // post-load to post-decode lazy growth
 
-    // the pool takes VRAM that the KV cache would otherwise grow into, so size the
-    // budget under an absolute rail: estimated max-context KV plus a fixed reserve
-    // must stay free, otherwise a run that is fine when cold hits the paging line at
-    // depth (858 MiB free vs 775 MiB free was measured at -1% vs -11% decode and
-    // 2.3x TTFT on a 32 GB WDDM card). note the estimate covers only the per-token
-    // growth (attention KV); recurrent-state and compute buffers are bounded and
-    // share the fixed reserve.
     ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), backend_id));
     size_t dev_free = 0;
     size_t dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 
-    size_t kv_max = 0;
-    for (int il = 0; il < (int) model.layers.size(); ++il) {
-        kv_max += ggml_row_size(cparams.type_k, model.hparams.n_embd_k_gqa(il))
-                + ggml_row_size(cparams.type_v, model.hparams.n_embd_v_gqa(il));
+    size_t used_now = 0;
+    size_t used_plus_reserve = 0;
+    bool memory_valid = dev_total != 0 && dev_free <= dev_total && rail_bytes < dev_total;
+    if (memory_valid) {
+        ceiling = dev_total - rail_bytes;
+        used_now = dev_total - dev_free;
+        memory_valid = future_reserve <= std::numeric_limits<size_t>::max() - used_now;
     }
-    kv_max *= cparams.n_ctx;
-
-    constexpr size_t pool_rail = 1024ull * 1024 * 1024; // keep >= 1 GiB free at max context
-    size_t pool_budget = (dev_free > kv_max + pool_rail) ? (dev_free - kv_max - pool_rail) : 0;
-
-    LLAMA_LOG_INFO("%s: expert pool budget %.2f GiB (free %.2f GiB - max-context KV %.2f GiB - %.2f GiB rail)\n",
-            __func__, pool_budget / 1024.0 / 1024.0 / 1024.0, dev_free / 1024.0 / 1024.0 / 1024.0,
-            kv_max / 1024.0 / 1024.0 / 1024.0, pool_rail / 1024.0 / 1024.0 / 1024.0);
-    if (pool_budget == 0) {
-        LLAMA_LOG_WARN("%s: expert cache disabled: free VRAM minus max-context KV leaves less than the %.2f GiB rail\n",
-                __func__, pool_rail / 1024.0 / 1024.0 / 1024.0);
+    if (memory_valid) {
+        used_plus_reserve = used_now + future_reserve;
+        memory_valid = ceiling >= used_plus_reserve;
+    }
+    const size_t pool_budget = memory_valid ? std::min(pool_bound, ceiling - used_plus_reserve) : 0;
+    char cap_mib_text[16];
+    snprintf(cap_mib_text, sizeof(cap_mib_text), "%zu", cap_mib);
+    LLAMA_LOG_WARN("expert pool limits cap_mib=%s rail_mib=%zu cap_bytes=%zu ceiling_bytes=%zu (env LLAMA_MOE_POOL_CAP_MIB / LLAMA_MOE_POOL_RAIL_MIB, defaults none / 2879)\n",
+            cap_set ? cap_mib_text : "none", rail_mib, pool_cap, ceiling);
+    LLAMA_LOG_INFO("%s: expert pool ledger total=%zu free=%zu used=%zu cap=%zu ceiling=%zu future_reserve=%zu budget=%zu\n",
+            __func__, dev_total, dev_free, used_now, pool_cap, ceiling, future_reserve, pool_budget);
+    if (!memory_valid) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: invalid or unavailable device memory report\n", __func__);
+        report_status("disabled", "invalid-device-memory", 0, 0, 0, pool_budget, "none");
+        return;
     }
 
-    // pool every MoE expert weight tensor that is actually offloaded to the host; when a
-    // layer has both fused gate_up and separate gate/up tensors only the fused one is
-    // used by the graph (see build_moe_ffn), so pooling the others would waste VRAM
-    for (const auto & layer : model.layers) {
-        // the collector is unbounded on purpose: expert-tensor layouts vary by arch
-        // (fused gate_up + down, separate up/gate/down, ...) and future ones may carry
-        // any number of expert tensors per layer
+    struct expert_pool_candidate {
+        ggml_tensor * w;
+        size_t n_expert;
+        size_t expert_size;
+        uint32_t routing_width;
+        size_t layer;
+    };
+    std::vector<expert_pool_candidate> candidates;
+
+    // Inventory and deduplicate every expert tensor before any backend allocation.
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        const auto & layer = model.layers[il];
         std::vector<ggml_tensor *> tensors;
         if (layer.ffn_gate_up_exps != nullptr) {
             tensors.push_back(layer.ffn_gate_up_exps);
@@ -685,44 +796,131 @@ void llama_context::init_expert_pools() {
             if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
                 continue;
             }
-
-            const int n_expert = (int) w->ne[2];
-            const int n_slots  = std::min<int64_t>((int64_t) cparams.expert_cache_slots, n_expert - 1);
-            if (n_slots <= 0) {
+            if (w->ne[2] <= 1 || (uint64_t) w->ne[2] > std::numeric_limits<size_t>::max()) {
+                LLAMA_LOG_INFO("%s: skip '%s': invalid expert count\n", __func__, w->name);
                 continue;
             }
-
-            const size_t pool_size = (size_t) n_slots * w->nb[2];
-            if (pool_size > pool_budget) {
-                n_skipped++;
-                LLAMA_LOG_INFO("%s: '%s' (%d slots, %.2f GiB) exceeds the remaining budget - layer falls back to the stock host-copy path\n",
-                        __func__, w->name, n_slots, pool_size / 1024.0 / 1024.0 / 1024.0);
+            const size_t n_expert = (size_t) w->ne[2];
+            const uint32_t routing_width = model.hparams.n_expert_used((uint32_t) il);
+            bool duplicate = false;
+            for (const auto & candidate : candidates) {
+                duplicate |= candidate.w == w;
+            }
+            if (duplicate) {
                 continue;
             }
-            pool_budget -= pool_size;
-
-            ggml_tensor * table = nullptr;
-            ggml_tensor * pool  = ggml_backend_sched_register_expert_pool(sched.get(), w, backend_id, n_slots, &table);
-            if (pool == nullptr) {
-                continue; // allocation failed, keep serving this tensor from host memory
-            }
-
-            expert_pools.emplace(w, llama_expert_pool{pool, table});
-            n_pooled++;
+            candidates.push_back({ w, n_expert, w->nb[2], routing_width, il });
         }
     }
 
-    if (n_pooled > 0) {
-        LLAMA_LOG_INFO("%s: pooled %d offloaded MoE expert weight tensors (%d skipped by the VRAM rail - those layers run the stock host-copy path)\n",
-                __func__, n_pooled, n_skipped);
-    } else if (n_skipped > 0) {
-        // every candidate was found but the budget rejected them all - saying "no
-        // offloaded tensors found" here sent the last reporter chasing a ghost
-        LLAMA_LOG_WARN("%s: expert cache had no effect: 0 of %d offloaded MoE expert weight tensors fit the VRAM budget - all layers run the stock host-copy path\n",
-                __func__, n_skipped);
-    } else {
+    if (candidates.empty()) {
         LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded MoE expert weight tensors found\n", __func__);
+        report_status("disabled", "no-offloaded-experts", 0, 0, 0, pool_budget, "none");
+        return;
     }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto & lhs, const auto & rhs) {
+        const int name_cmp = std::strcmp(lhs.w->name, rhs.w->name);
+        if (name_cmp != 0) {
+            return name_cmp < 0;
+        }
+        return std::tie(lhs.n_expert, lhs.expert_size) < std::tie(rhs.n_expert, rhs.expert_size);
+    });
+
+    size_t routing_width = 0;
+    for (const auto & candidate : candidates) {
+        routing_width = std::max(routing_width, (size_t) candidate.routing_width);
+    }
+    size_t slot_max = (size_t) cparams.expert_cache_slots;
+    for (const auto & candidate : candidates) {
+        slot_max = std::min(slot_max, candidate.n_expert - 1);
+    }
+    const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_sched_get_buffer_type(
+            sched.get(), ggml_backend_sched_get_backend(sched.get(), backend_id)));
+    std::vector<struct ggml_backend_expert_pool_candidate> plan_candidates;
+    for (const auto & candidate : candidates) {
+        plan_candidates.push_back({ candidate.n_expert, candidate.expert_size, candidate.routing_width,
+                profile_weights[candidate.layer] });
+    }
+    std::vector<size_t> plan_slots(candidates.size(), 0);
+    struct ggml_backend_expert_pool_plan plan = {};
+    if (!ggml_backend_expert_pool_plan_weighted(plan_candidates.data(), plan_candidates.size(),
+            (size_t) cparams.expert_cache_slots, pool_budget, alignment, plan_slots.data(), &plan)) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: per-layer weighted slots do not fit at the routing floors in [%zu,%zu] slots\n",
+                __func__, routing_width, (size_t) cparams.expert_cache_slots);
+        for (const auto & candidate : candidates) {
+            LLAMA_LOG_INFO("%s: skip '%s': no admission at the routing minimum\n", __func__, candidate.w->name);
+        }
+        report_status("disabled", "admission-failed", 0, 0, 0, pool_budget, "none");
+        return;
+    }
+
+    LLAMA_LOG_INFO("%s: expert pool candidates=%zu alloc=%s profile=%s requested=%d selected_max=%zu S_min=%zu S_max=%zu total_slots=%zu planned_device=%zu planned_host=%zu\n",
+            __func__, candidates.size(), alloc_kind, profile_state, cparams.expert_cache_slots, plan.n_slots, routing_width,
+            slot_max, plan.total_slots, plan.device_bytes, plan.host_bytes);
+
+    const char * limited_by = "rail";
+    if (plan.total_slots == (size_t) cparams.expert_cache_slots * candidates.size()) {
+        limited_by = "slots";
+    } else if (cap_set && pool_budget == pool_cap) {
+        limited_by = "cap";
+    }
+
+    size_t actual_device_total = 0;
+    size_t actual_host_total = 0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto & candidate = candidates[i];
+        const size_t slots_i = plan_slots[i];
+        struct ggml_backend_expert_pool_candidate one_candidate = { candidate.n_expert, candidate.expert_size,
+                candidate.routing_width, profile_weights[candidate.layer] };
+        struct ggml_backend_expert_pool_plan one_plan = {};
+        if (!ggml_backend_expert_pool_plan_uniform(&one_candidate, 1, slots_i, slots_i,
+                std::numeric_limits<size_t>::max(), alignment, &one_plan)) {
+            LLAMA_LOG_WARN("%s: expert cache disabled: checked allocation sizing failed for '%s'\n", __func__, candidate.w->name);
+            ggml_backend_sched_clear_expert_pools(sched.get());
+            expert_pools.clear();
+            report_status("disabled", "allocation-sizing-failed", 0, 0, 0, pool_budget, "none");
+            return;
+        }
+        ggml_tensor * table = nullptr;
+        size_t actual_device = 0;
+        size_t actual_host = 0;
+        ggml_tensor * pool = ggml_backend_sched_register_expert_pool_with_reservation(sched.get(), candidate.w,
+                backend_id, (int) slots_i, one_plan.device_bytes, &actual_device, &actual_host, &table);
+        if (pool == nullptr || actual_device > one_plan.device_bytes ||
+            actual_device_total > std::numeric_limits<size_t>::max() - actual_device ||
+            actual_host_total > std::numeric_limits<size_t>::max() - actual_host) {
+            LLAMA_LOG_WARN("%s: expert cache disabled: registration failed for '%s'; rolling back complete admission\n",
+                    __func__, candidate.w->name);
+            ggml_backend_sched_clear_expert_pools(sched.get());
+            expert_pools.clear();
+            report_status("disabled", "registration-failed", 0, 0, 0, pool_budget, "none");
+            return;
+        }
+        actual_device_total += actual_device;
+        actual_host_total += actual_host;
+        expert_pools.emplace(candidate.w, llama_expert_pool{pool, table});
+        LLAMA_LOG_INFO("%s: registered '%s': %zu slots planned_device=%zu actual_device=%zu actual_host=%zu\n",
+                __func__, candidate.w->name, slots_i, one_plan.device_bytes, actual_device, actual_host);
+    }
+
+    if (actual_device_total > pool_budget) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: actual backend bytes exceeded budget; rolling back complete admission\n", __func__);
+        ggml_backend_sched_clear_expert_pools(sched.get());
+        expert_pools.clear();
+        report_status("disabled", "actual-bytes-exceeded-budget", 0, 0, actual_device_total, pool_budget, "none");
+        return;
+    }
+
+    std::sort(plan_slots.begin(), plan_slots.end());
+    slots_min = plan_slots.front();
+    slots_max = plan_slots.back();
+    slots_med = plan_slots[plan_slots.size() / 2];
+    total_slots = plan.total_slots;
+
+    LLAMA_LOG_INFO("%s: expert cache enabled: pools=%zu alloc=%s profile=%s selected_max=%zu total_slots=%zu actual_device=%zu actual_host=%zu budget=%zu ceiling=%zu\n",
+            __func__, expert_pools.size(), alloc_kind, profile_state, plan.n_slots, plan.total_slots, actual_device_total, actual_host_total, pool_budget, ceiling);
+    report_status("enabled", "admitted", plan.n_slots, expert_pools.size(), actual_device_total, pool_budget, limited_by);
 }
 
 void llama_context::sched_reserve() {
@@ -2660,6 +2858,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.expert_pools=*/ expert_pools.empty() ? nullptr : &expert_pools,
+        /*.expert_pool_diagnostic_state=*/ expert_pool_diagnostic_state,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

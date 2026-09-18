@@ -1747,7 +1747,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
-    cparams.expert_cache_slots = params.expert_cache_slots;
+
+    const bool spec_draft = params.speculative.has_dft() || std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type type) {
+            return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                   type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+    cparams.expert_cache_slots = spec_draft ? 0 : params.expert_cache_slots;
+    if (spec_draft && params.expert_cache_slots > 0) {
+        LOG_INF("%s: forcing expert cache slots to 0: speculative draft/MTP selection disables expert pooling\n", __func__);
+    }
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
