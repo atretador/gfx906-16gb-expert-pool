@@ -1,126 +1,131 @@
-# llama.cpp
+# gfx906-16gb-expert-pool
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+An unofficial fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) that adds a persistent
+expert pool (expert cache) for MoE models whose experts are offloaded with `--n-cpu-moe`, and makes
+that cache actually usable on a 16 GB gfx906 card (Radeon Pro VII / MI50 / MI60).
 
-<div align="center">
+Experimental. Locally validated on one card and one model. Not affiliated with, endorsed by, or
+submitted to the ggml-org project.
 
-<b>LLM inference in C/C++</b>
+## Why this fork exists
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+- Upstream llama.cpp has **no expert cache**. `--n-cpu-moe N` moves routed experts to the CPU, but
+  every token then re-copies the experts it needs over PCIe. At 128K context on a 16 GB card that
+  costs roughly 40% of decode throughput.
+- A persistent expert pool exists in a separate fork (see Credits), but its admission budget reserves
+  the **full configured context KV** plus a hard 3 GiB cap. On a 16 GB device at 128K that admits
+  **0 of 144** offloaded expert tensors, so the feature silently does nothing.
+- This fork keeps the pool mechanism and replaces the budget with a rail-based ledger, adds a
+  weighted per-layer planner, adds telemetry, and makes the pool fail closed when speculative
+  draft/MTP decoding is selected.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+The pool is not the win by itself. The admission fix is what turns "0 tensors fit" into 66 slots.
 
-</div>
+## Credits
 
-## Quick start
+- Expert pool implementation (`--moe-expert-cache`, pool allocator, LRU slots, graph and expert-ID
+  remap): originally written by **zhanghewei** in
+  [`memoriaru/llama.cpp`](https://github.com/memoriaru/llama.cpp) branch `moe-expert-pool` at
+  `555d1ec9daa4564cb06adb39c469acfdcd1d1e93`. Carried here as the first commit, authorship
+  preserved. See PROVENANCE.md.
+- llama.cpp and ggml: the ggml authors, MIT. Includes the upstream `qwen4exp` architecture.
+- Validated model: [AtomicChat/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF),
+  `AD-3.84bpw-IQ4_XS-M64`.
+- ROCm/gfx906 build base: [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906).
 
-A few options to get `llama.cpp` installed on your machine:
+## Build (gfx906 / ROCm)
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
+`docker/Dockerfile` builds against a pinned ROCm/gfx906 base image and compiles the fork with
+`-DGGML_HIP=ON -DGPU_TARGETS=gfx906`:
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+docker build -f docker/Dockerfile -t local/llama.cpp-gfx906:expert-pool .
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The image records the source commit and a source-tree digest in `/etc/llama.cpp-provenance`, so a
+built image can be tied back to an exact tree.
 
-## Description
+## Usage
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+```sh
+llama-server -m <model.gguf> --n-cpu-moe 48 -ngl 99 -c 131072 \
+  -ctk q8_0 -ctv q8_0 -fa on --moe-expert-cache 66
+```
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+- `--moe-expert-cache N` / `-mec N`: requested pool slots **per offloaded expert weight tensor**
+  (not a global count, not tokens). Each tensor gets its own pool. `0` disables the pool.
+- `-ngl`/`--n-cpu-moe` decide how many layers are offloaded. The pool only applies to offloaded MoE
+  tensors.
+- Decode-shaped operations (few tokens per step) use the pool. Large prefill batches bypass it and
+  run the stock host-copy path, which is intentional.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+Environment knobs:
 
-## Supported backends
-
-| Backend | Target devices |
+| Variable | Meaning |
 | --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| `LLAMA_MOE_POOL_RAIL_MIB` | VRAM held back from the pool for compute buffers and later allocations. Default 2879 MiB, hard floor 1024 MiB. Lower it to admit more slots. |
+| `LLAMA_MOE_POOL_CAP_MIB` | Optional absolute cap on total pool bytes. Unset means no cap. `0` is rejected. |
+| `LLAMA_MOE_POOL_PROFILE` | Optional text file with one `blk.<layer_index> <weight>` line per layer for weighted slot allocation. Missing or malformed entries fall back to weight 1.0. |
+| `GGML_MOE_POOL_STATS` | Set to any value for per-pool hit/miss detail on top of the aggregate reports. |
 
-## Documentation
+Telemetry, one line per event type, visible at the default log level:
 
-#### Tools
+```
+expert pool status=enabled reason=admitted requested_slots=66 actual_slots=66 pool_count=144 bytes=5292195840 cap=7793213440 ceiling=15015608320 limited_by=slots alloc=uniform profile=none slots_min=66 slots_med=66 slots_max=66 total_slots=9504
+expert pool first-use=active reason=distinct-experts-within-slots
+expert pool runtime reason=shutdown hits=... misses=... evictions=... hit_rate=... copy_bytes=...
+```
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+`limited_by` says what actually constrained admission (`slots`, `rail` or `cap`), and `copy_bytes` is
+the number of bytes copied on misses. Watch `copy_bytes`, not the hit-rate percentage: a slot moved
+to a cheaper tensor raises the hit count while increasing bytes moved.
 
-#### Development
+## Measured results
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+MI50 16 GB, gfx906/ROCm, `Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64`, 128K context, Q8_0 K/V,
+`--n-cpu-moe 48`, flash attention on, speculative decoding off, 18 threads, batch 2048 / ubatch 512.
 
-## Contributing
+| configuration | decode | VRAM (steady) | notes |
+| --- | --- | --- | --- |
+| `--moe-expert-cache 0` | 11.76 t/s | 10.17 GiB | stock CPU MoE path |
+| `--moe-expert-cache 80` (actual 40 slots) | **16.39 t/s** | ~13.5 GiB | 144 pools, 61.8% hit rate |
+| `--moe-expert-cache 66` | 16.90 / 17.60 t/s cold / warm | 15.24 GiB peak | shipping profile, ~69% hits |
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+Supporting measurements, with their limits:
 
-## Acknowledgements
+- VRAM ceiling: 66 slots peaks at 14.93 GiB on short generations, 68 slots at 15.4 to 15.6 GiB, and
+  72 slots was rejected (over 15.8 GiB, 147 MB free, visible microstutter). VRAM peak depends on
+  generation length, so validate with your own workload.
+- Cold cache is slower: the first requests run at roughly 6 t/s while the pool fills, reaching the
+  warm figure after the working set is resident.
+- The benefit is routing-locality dependent. A batch-1/ubatch-1 churn workload at 46.9% hits ran
+  1.8x slower than cache-off, because every decode token drove 144 synchronous pool updates.
+- A fixed-token perplexity comparison measured 1.0987 (cache off) versus 1.0480 (cache on). **This is
+  not a quality improvement claim.** The two configurations run MoE arithmetic on different backends,
+  and the sample was far too small to bound quality; treat the numbers as evidence of no measured
+  degradation only.
+- Enabling the pool is **not bit-identical** to cache-off: it moves MoE compute from the CPU backend
+  to the accelerator, and those backends already differ in arithmetic for every quant type. Pool
+  parity is bit-exact against the stock host-copy path when compared on the same backend.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Donor-reported numbers are not reproduced here and should not be read as MI50 results: the donor
+measured +84% at 64 slots on an RTX 4090, a third party measured 2.8x slower at 16 slots and +54% at
+160 slots on a PCIe 3.0 system, and an RX 9070 Vulkan report recorded regressions at 16/32/64 slots.
+
+What this does not show: no contexts above 128K (admission can fall to zero), no vision workloads, no
+MTP/speculative decoding, one model, one card.
+
+## Updating from upstream
+
+```sh
+git fetch upstream
+git rebase upstream/master
+```
+
+Conflicts are expected in `README.md` (this file replaces upstream's), `common/arg.cpp`,
+`src/llama-context.cpp`, `src/llama-graph.cpp` and `ggml/src/ggml-backend.cpp`. After rebasing,
+rebuild for gfx906 and re-run `test-expert-pool`.
+
+## License
+
+MIT, same as upstream llama.cpp.
