@@ -83,21 +83,53 @@ to a cheaper tensor raises the hit count while increasing bytes moved.
 ## Measured results
 
 MI50 16 GB, gfx906/ROCm, `Qwen3.8-Flash-Next-AD-3.84bpw-IQ4_XS-M64`, 128K context, Q8_0 K/V,
-`--n-cpu-moe 48`, flash attention on, speculative decoding off, 18 threads, batch 2048 / ubatch 512.
+`--n-cpu-moe 48`, expert-pool rail 2048 MiB, flash attention on, speculative decoding off, 18 threads,
+batch 2048 / ubatch 512. Measured on commit `e815ead0d` (merge of upstream master `58367713a`,
+2026-09-21), image `local/llama.cpp-gfx906:fork-128k-20260921`.
 
-| configuration | decode | VRAM (steady) | notes |
+Each configuration loads the model and then issues two fixed 700-token generations at temperature 0 and
+seed 42; the first is reported as cold (empty pool), the second as warm. Decode figures are the single-run
+`timings.predicted_per_second` of each generation, not medians.
+
+| configuration | decode cold / warm | VRAM peak | notes |
 | --- | --- | --- | --- |
-| `--moe-expert-cache 0` | 11.76 t/s | 10.17 GiB | stock CPU MoE path |
-| `--moe-expert-cache 80` (actual 40 slots) | **16.39 t/s** | ~13.5 GiB | 144 pools, 61.8% hit rate |
-| `--moe-expert-cache 66` | 16.90 / 17.60 t/s cold / warm | 15.24 GiB peak | shipping profile, ~69% hits |
+| `--moe-expert-cache 0` | 12.83 / 13.61 t/s | 9.79 GiB | stock CPU MoE path, 6.19 GiB free |
+| `--moe-expert-cache 66` | 18.59 / 19.00 t/s | 14.93 GiB | shipping profile, 66 slots, 144 pools, 72.9% hits, 1.05 GiB free |
+| `--moe-expert-cache 80` | 18.80 / 20.40 t/s | 15.84 GiB | 80 slots admitted, 77.1% hits, 0.15 GiB free |
+
+Cache-off and cache-on outputs are not bit-identical (see below). Both pool configurations produced the
+same output hash, and the pool path is deterministic across runs at a fixed seed.
+
+### Previous build against this build
+
+| configuration | previous build | current build |
+| --- | --- | --- |
+| `--moe-expert-cache 0` | 11.76 t/s | 12.83 / 13.61 t/s |
+| `--moe-expert-cache 66` | 16.90 / 17.60 t/s, ~69% hits | 18.59 / 19.00 t/s, 72.9% hits |
+| `--moe-expert-cache 80` | 16.39 t/s, 40 slots admitted, 61.8% hits | 18.80 / 20.40 t/s, 80 slots admitted, 77.1% hits |
+
+- Previous build: image `local/llama.cpp-gfx906:fork-128k-20260918`, base commit `972d2313b`
+  (upstream `b11028`), 2026-09-17.
+- Current build: image `local/llama.cpp-gfx906:fork-128k-20260921`, merge commit `e815ead0d`
+  (upstream master `58367713a`), 2026-09-21.
+
+This is not a controlled A/B. The previous figures came from an earlier harness with a different fixed
+prompt (about 78 tokens against 66 now), and the cache-off row moved too (11.76 to 12.83 t/s) even
+though this fork does not touch that path. Part of the gain is upstream and harness drift, not the
+pool. Only the current-build table above is reproducible with `bench_expert_pool.sh`.
+
+The 80-slot row is not comparable in kind. The previous build admitted only 40 slots because its rail
+and cap bound the request, so that figure measures a 40-slot pool against today's 80-slot pool.
 
 Supporting measurements, with their limits:
 
-- VRAM ceiling: 66 slots peaks at 14.93 GiB on short generations, 68 slots at 15.4 to 15.6 GiB, and
-  72 slots was rejected (over 15.8 GiB, 147 MB free, visible microstutter). VRAM peak depends on
-  generation length, so validate with your own workload.
-- Cold cache is slower: the first requests run at roughly 6 t/s while the pool fills, reaching the
-  warm figure after the working set is resident.
+- VRAM ceiling: 66 slots peaks at 14.93 GiB, 80 slots at 15.84 GiB with only 148 MB free. The 80-slot
+  configuration completed this benchmark without an allocation failure, but at that headroom there is no
+  margin for a longer context or a second client, and an earlier build showed microstutter at a
+  comparable peak. Treat 66 slots as the validated profile and 80 as experimental. VRAM peak depends on
+  context and generation length, so validate with your own workload.
+- Cold versus warm is a small effect at this profile: once prefill has populated the pool, the first
+  generation runs within about 2% of the warm figure (18.59 versus 19.00 t/s at 66 slots).
 - The benefit is routing-locality dependent. A batch-1/ubatch-1 churn workload at 46.9% hits ran
   1.8x slower than cache-off, because every decode token drove 144 synchronous pool updates.
 - A fixed-token perplexity comparison measured 1.0987 (cache off) versus 1.0480 (cache on). **This is
@@ -114,6 +146,18 @@ measured +84% at 64 slots on an RTX 4090, a third party measured 2.8x slower at 
 
 What this does not show: no contexts above 128K (admission can fall to zero), no vision workloads, no
 MTP/speculative decoding, one model, one card.
+
+### Reported on other models
+
+Reported by the fork maintainer on different models and profiles. These do not use the protocol above
+and are not reproduced here; the profiles differ in offload count, slot count, context and parallelism.
+
+- [SC117/Ling-3.0-flash-abliterated-APEX-GGUF](https://huggingface.co/SC117/Ling-3.0-flash-abliterated-APEX-GGUF)
+  compact: CPU layers 36 -> 41, expert cache 76, 200K context, Q8_0, about 22 tk/s -> 26 tk/s.
+- [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) IQ4_NL_XL:
+  CPU layers 22 -> 40, expert cache 124, 256K context, Q8_0, 33.7 tk/s -> 44.6 tk/s flat.
+- Same model, expert cache 96, 303K context, Q8_0, parallel 2 (151552 per stream): single stream
+  33.7 tk/s -> 44.6 tk/s flat, two-stream aggregate about 40 tk/s -> 60 tk/s.
 
 ## Updating from upstream
 
