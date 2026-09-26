@@ -21,6 +21,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_prec_policy;
 
 struct llama_memory_context_i;
 
@@ -806,6 +807,8 @@ struct llm_graph_params {
     const llama_expert_pools     * expert_pools = nullptr;
     std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state;
 
+    const llama_prec_policy * prec_policy = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1049,6 +1052,8 @@ struct llm_graph_context {
     // expert weight pools by original weight tensor (may be null)
     const llama_expert_pools     * expert_pools;
     std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state;
+
+    const llama_prec_policy * prec_policy;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
