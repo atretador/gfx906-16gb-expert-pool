@@ -377,6 +377,13 @@ extern "C" {
         int32_t  expert_pool_fallback;  // disable the expert pool for the rest of the context
                                        // when its decode hit rate stays below this percent after
                                        // a warm-up window (0 = never fall back) [EXPERIMENTAL]
+        const int32_t * expert_cache_slots_per_device; // per-device expert slots in device order,
+                                       // expert_cache_slots_per_device_count entries (NULL = use
+                                       // expert_cache_slots for every device) [EXPERIMENTAL]
+        int32_t  expert_cache_slots_per_device_count; // number of entries in the array above
+        const char * moe_cache_range;  // per-device cached layer ranges, "lo-hi,lo-hi,..." in
+                                       // device order, a '-' entry caches nothing (NULL = derive
+                                       // from layer ownership) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

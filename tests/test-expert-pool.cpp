@@ -18,6 +18,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "../common/common.h"
+#include "../src/llama-moe-cache-range.h"
 
 #include <cmath>
 #include <cstdio>
@@ -173,6 +174,8 @@ static bool test_profile_parser() {
 static bool test_mtp_parameter_guard() {
     common_params params;
     params.expert_cache_slots = 64;
+    params.expert_cache_slots_per_device = { 10, 20 };
+    params.moe_cache_range = "0-1,2-3";
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
 
     const llama_context_params mtp = common_context_params_to_llama(params);
@@ -183,7 +186,10 @@ static bool test_mtp_parameter_guard() {
     common_params regular_params;
     regular_params.expert_cache_slots = 64;
     const llama_context_params regular = common_context_params_to_llama(regular_params);
-    const bool ok = mtp.expert_cache_slots == 0 && draft.expert_cache_slots == 0 &&
+    const bool ok = mtp.expert_cache_slots == 0 && mtp.expert_cache_slots_per_device == nullptr &&
+        mtp.expert_cache_slots_per_device_count == 0 && mtp.moe_cache_range == nullptr &&
+        draft.expert_cache_slots == 0 && draft.expert_cache_slots_per_device == nullptr &&
+        draft.moe_cache_range == nullptr &&
         regular.expert_cache_slots == 64;
     printf("MTP parameter guard: %s\n", ok ? "ok" : "FAILED");
     return ok;
@@ -570,6 +576,84 @@ static bool test_mixed_slot_pools(ggml_backend_t accel, ggml_backend_buffer_type
     return ok;
 }
 
+// two independent per-device groups: each is planned with its own budget, and each keeps
+// its own routing floor
+static bool test_planner_grouping() {
+    const size_t alignment = 64;
+    const struct ggml_backend_expert_pool_candidate group0[] = {
+        { 8, 100, 2, 1.0f }, { 8, 100, 2, 1.0f },
+    };
+    const struct ggml_backend_expert_pool_candidate group1[] = {
+        { 16, 100, 4, 1.0f },
+    };
+    size_t slots0[2] = {};
+    size_t slots1[1] = {};
+    struct ggml_backend_expert_pool_plan plan0 = {};
+    struct ggml_backend_expert_pool_plan plan1 = {};
+
+    bool ok = ggml_backend_expert_pool_plan_weighted(group0, 2, 4, 4096, alignment, slots0, &plan0) &&
+        ggml_backend_expert_pool_plan_weighted(group1, 1, 4, 4096, alignment, slots1, &plan1) &&
+        plan0.enabled && plan1.enabled;
+    ok &= slots0[0] >= 2 && slots0[1] >= 2; // routing floor of group 0
+    ok &= slots1[0] >= 4;                   // routing floor of group 1
+    ok &= plan0.total_slots == 8 && plan1.total_slots == 4;
+
+    // a device with no budget admits nothing, the other group is unaffected
+    struct ggml_backend_expert_pool_plan empty = {};
+    ok &= !ggml_backend_expert_pool_plan_weighted(group0, 2, 4, 0, alignment, slots0, &empty);
+    ok &= ggml_backend_expert_pool_plan_weighted(group1, 1, 4, 4096, alignment, slots1, &plan1) && plan1.enabled;
+
+    printf("per-device planner grouping: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+// -mcr parser/validator on synthetic ownership and offload sets (no second GPU needed)
+static bool test_moe_cache_range() {
+    const int n_layer = 6;
+    const int n_device = 2;
+    // device 0 owns layers 0..2, device 1 owns 3..5
+    std::vector<int> owner = { 0, 0, 0, 1, 1, 1 };
+    llama_moe_cache_range r;
+    std::string err;
+
+    auto valid = [&](const std::vector<uint8_t> & off, const char * text) {
+        err.clear();
+        return llama_moe_cache_range_parse(text, n_device, r, err) &&
+               llama_moe_cache_range_validate(r, owner, off, n_layer, n_device, err);
+    };
+
+    // layers 0..4 offloaded: device 0 covers 0..2, device 1 covers 3..4
+    const std::vector<uint8_t> off = { 1, 1, 1, 1, 1, 0 };
+    bool ok = true;
+    ok &= valid(off, "0-2,3-4");
+    ok &= valid(off, " 0-2 , 3-4 ");      // whitespace tolerated
+    ok &= !valid(off, "0-2,3-4,5-5");     // entry count != device count
+    ok &= !valid(off, "0-2,3");           // malformed (no dash)
+    ok &= !valid(off, "0-2,4-3");         // malformed (lo > hi)
+    ok &= !valid(off, "0-2,3-9");         // hi >= layer count
+    ok &= !valid(off, "0-3,4-4");         // layer 3 owned by device 1
+    ok &= !valid(off, "0-2,3-5");         // layer 5 not offloaded
+    ok &= !valid(off, "0-2,2-4");         // overlap
+    ok &= !valid(off, "0-1,4-4");         // gap and incomplete coverage
+    ok &= !valid(off, "0-1,3-4");         // offloaded layer 2 not covered
+
+    // out-of-range and overflow: must be rejected before any narrowing cast
+    ok &= !valid(off, "0-4294967296,-");            // hi > INT_MAX
+    ok &= !valid(off, "0-2147483648,-");            // hi == INT_MAX + 1
+    ok &= !valid(off, "0-99999999999999999999,-");  // hi overflows long (ERANGE)
+    ok &= !valid(off, "-1-2,3-4");                  // "-1-2" is malformed, not a negative lo
+    ok &= !valid(off, "99999999999999999999-2,3-4"); // lo overflows long (ERANGE)
+
+    // device 1 owns no offloaded layer: an empty entry is the correct declaration
+    const std::vector<uint8_t> off0 = { 1, 1, 1, 0, 0, 0 };
+    ok &= valid(off0, "0-2,-");
+    ok &= valid(off0, "0-2,");            // trailing empty token = empty entry
+    ok &= !valid(off0, "0-2,3-4");        // layer 3 not offloaded
+
+    printf("moe cache range: %s\n", ok ? "ok" : "FAILED");
+    return ok;
+}
+
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (!test_uniform_planner()) {
@@ -582,6 +666,12 @@ int main() {
         return 1;
     }
     if (!test_mtp_parameter_guard()) {
+        return 1;
+    }
+    if (!test_planner_grouping()) {
+        return 1;
+    }
+    if (!test_moe_cache_range()) {
         return 1;
     }
     // find an accelerator backend to host the pool

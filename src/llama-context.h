@@ -307,11 +307,13 @@ private:
         std::make_shared<llama_expert_pool_diagnostic_state>();
     bool expert_pool_status_reported = false;
 
-    // warmth gate bookkeeping (single-threaded, updated from llama_context::decode)
-    long long expert_pool_fallback_last_hits   = 0;
-    long long expert_pool_fallback_last_misses = 0;
-    int64_t   expert_pool_fallback_decodes     = 0;
-    int64_t   expert_pool_fallback_below       = 0;
+    // warmth gate bookkeeping, indexed by scheduler backend (single-threaded, from decode)
+    std::vector<long long> expert_pool_fallback_last_hits;
+    std::vector<long long> expert_pool_fallback_last_misses;
+    std::vector<int64_t>   expert_pool_fallback_below;
+    std::vector<bool>      expert_pool_fallback_owning;  // backend hosts at least one pool
+    std::vector<bool>      expert_pool_fallback_tripped; // backend already fell back
+    int64_t                expert_pool_fallback_decodes = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

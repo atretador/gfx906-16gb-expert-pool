@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-moe-cache-range.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
@@ -280,6 +281,11 @@ llama_context::llama_context(
 
     cparams.expert_cache_slots = params.expert_cache_slots;
     cparams.expert_pool_fallback = params.expert_pool_fallback;
+    if (params.expert_cache_slots_per_device != nullptr && params.expert_cache_slots_per_device_count > 0) {
+        cparams.expert_cache_slots_per_device.assign(params.expert_cache_slots_per_device,
+                params.expert_cache_slots_per_device + params.expert_cache_slots_per_device_count);
+    }
+    cparams.moe_cache_range = params.moe_cache_range != nullptr ? params.moe_cache_range : "";
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -671,6 +677,10 @@ void llama_context::init_expert_pools() {
     size_t slots_max = 0;
     size_t total_slots = 0;
 
+    // requested slots shown by report_status: the scalar value on the legacy path, the
+    // largest per-device value in per-device mode (updated once the list is validated)
+    int32_t report_requested_slots = cparams.expert_cache_slots;
+
     auto report_status = [&](const char * status, const char * reason, size_t actual_slots,
             size_t pool_count, size_t bytes, size_t cap, const char * limited_by) {
         if (expert_pool_status_reported) {
@@ -678,8 +688,26 @@ void llama_context::init_expert_pools() {
         }
         expert_pool_status_reported = true;
         LLAMA_LOG_WARN("expert pool status=%s reason=%s requested_slots=%d actual_slots=%zu pool_count=%zu bytes=%zu cap=%zu ceiling=%zu limited_by=%s alloc=%s profile=%s slots_min=%zu slots_med=%zu slots_max=%zu total_slots=%zu\n",
-                status, reason, cparams.expert_cache_slots, actual_slots, pool_count, bytes, cap, ceiling, limited_by,
+                status, reason, report_requested_slots, actual_slots, pool_count, bytes, cap, ceiling, limited_by,
                 alloc_kind, profile_state, slots_min, slots_med, slots_max, total_slots);
+    };
+
+    // reset the per-backend warmth-gate bookkeeping after (re)registration. the global
+    // disabled master is left alone: a previous trip stays in effect across re-init
+    auto init_fallback_state = [&]() {
+        const size_t nb = backends.size();
+        expert_pool_fallback_last_hits.assign(nb, 0);
+        expert_pool_fallback_last_misses.assign(nb, 0);
+        expert_pool_fallback_below.assign(nb, 0);
+        expert_pool_fallback_owning.assign(nb, false);
+        expert_pool_fallback_tripped.assign(nb, false);
+        expert_pool_fallback_decodes = 0;
+        for (const auto & entry : expert_pools) {
+            const int b = entry.second.backend_id;
+            if (b >= 0 && (size_t) b < nb) {
+                expert_pool_fallback_owning[b] = true;
+            }
+        }
     };
 
     if (!limits_valid) {
@@ -687,7 +715,40 @@ void llama_context::init_expert_pools() {
         return;
     }
 
-    if (cparams.expert_cache_slots <= 0) {
+    const bool per_device_slots = !cparams.expert_cache_slots_per_device.empty();
+    const size_t n_dev = model.n_devices();
+
+    // -mec with several values: hard error unless there is exactly one value per device
+    if (per_device_slots) {
+        if (n_dev <= 1) {
+            throw std::runtime_error("--moe-expert-cache with multiple values requires more than one device");
+        }
+        if (cparams.expert_cache_slots_per_device.size() != n_dev) {
+            throw std::runtime_error("--moe-expert-cache list has " +
+                    std::to_string(cparams.expert_cache_slots_per_device.size()) + " values but the model uses " +
+                    std::to_string(n_dev) + " devices");
+        }
+        for (const int32_t slots : cparams.expert_cache_slots_per_device) {
+            report_requested_slots = std::max(report_requested_slots, slots);
+        }
+    }
+
+    // -mcr declares cache membership, so it cannot be combined with -mec 0, including a
+    // zero entry in a per-device -mec list
+    if (!cparams.moe_cache_range.empty()) {
+        if (!per_device_slots && cparams.expert_cache_slots <= 0) {
+            throw std::runtime_error("--moe-cache-range requires --moe-expert-cache greater than 0");
+        }
+        if (per_device_slots) {
+            for (const int32_t slots : cparams.expert_cache_slots_per_device) {
+                if (slots <= 0) {
+                    throw std::runtime_error("--moe-cache-range requires --moe-expert-cache greater than 0 for every device");
+                }
+            }
+        }
+    }
+
+    if (!per_device_slots && cparams.expert_cache_slots <= 0) {
         report_status("disabled", "slots-disabled", 0, 0, 0, pool_cap, "none");
         return;
     }
@@ -706,38 +767,44 @@ void llama_context::init_expert_pools() {
         return;
     }
 
-    {
-        int n_accel = 0;
-        for (const auto & b : backends) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                n_accel++;
+    // legacy single-device path: keep the exact old guard and the first-accelerator mapping
+    // so a one-GPU context behaves byte for byte as before (Plan B invariant B)
+    if (n_dev <= 1) {
+        if (!cparams.moe_cache_range.empty()) {
+            LLAMA_LOG_WARN("%s: --moe-cache-range ignored: single-device context uses the legacy path\n", __func__);
+        }
+
+        {
+            int n_accel = 0;
+            for (const auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    n_accel++;
+                }
+            }
+            if (n_accel > 1) {
+                // pools would live on the first accelerator while some layers run on
+                // others - the pooled FFNs would either migrate devices or copy the pool
+                // cross-device every step. untested and likely slower than the stock path.
+                LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports only one\n", __func__, n_accel);
+                report_status("disabled", "multiple-accelerators", 0, 0, 0, pool_cap, "none");
+                return;
             }
         }
-        if (n_accel > 1) {
-            // pools would live on the first accelerator while some layers run on
-            // others - the pooled FFNs would either migrate devices or copy the pool
-            // cross-device every step. untested and likely slower than the stock path.
-            LLAMA_LOG_WARN("%s: expert cache disabled: %d accelerator devices present, pooling currently supports exactly one\n", __func__, n_accel);
-            report_status("disabled", "multiple-accelerators", 0, 0, 0, pool_cap, "none");
+
+        // experts are pooled on the compute backend running the layers (the first accelerator)
+        int backend_id = -1;
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(backends[i].get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            backend_id = i;
+            break;
+        }
+        if (backend_id < 0) {
+            LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
+            report_status("disabled", "no-accelerator", 0, 0, 0, pool_cap, "none");
             return;
         }
-    }
-
-    // experts are pooled on the compute backend running the layers (the first accelerator)
-    // TODO: with multiple accelerators, pick the backend of each layer instead
-    int backend_id = -1;
-    for (size_t i = 0; i < backends.size(); ++i) {
-        if (ggml_backend_dev_type(ggml_backend_get_device(backends[i].get())) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            continue;
-        }
-        backend_id = i;
-        break;
-    }
-    if (backend_id < 0) {
-        LLAMA_LOG_WARN("%s: expert cache ignored: no accelerator backend found\n", __func__);
-        report_status("disabled", "no-accelerator", 0, 0, 0, pool_cap, "none");
-        return;
-    }
 
     constexpr size_t future_reserve = 180158464ull; // post-load to post-decode lazy growth
 
@@ -901,7 +968,7 @@ void llama_context::init_expert_pools() {
         }
         actual_device_total += actual_device;
         actual_host_total += actual_host;
-        expert_pools.emplace(candidate.w, llama_expert_pool{pool, table});
+        expert_pools.emplace(candidate.w, llama_expert_pool{pool, table, backend_id, false});
         LLAMA_LOG_INFO("%s: registered '%s': %zu slots planned_device=%zu actual_device=%zu actual_host=%zu\n",
                 __func__, candidate.w->name, slots_i, one_plan.device_bytes, actual_device, actual_host);
     }
@@ -922,7 +989,417 @@ void llama_context::init_expert_pools() {
 
     LLAMA_LOG_INFO("%s: expert cache enabled: pools=%zu alloc=%s profile=%s selected_max=%zu total_slots=%zu actual_device=%zu actual_host=%zu budget=%zu ceiling=%zu\n",
             __func__, expert_pools.size(), alloc_kind, profile_state, plan.n_slots, plan.total_slots, actual_device_total, actual_host_total, pool_budget, ceiling);
+    init_fallback_state();
     report_status("enabled", "admitted", plan.n_slots, expert_pools.size(), actual_device_total, pool_budget, limited_by);
+        return;
+    }
+
+    // ---- per-device path (Plan B): each GPU pools the expert layers it owns ----
+    GGML_ASSERT(!cparams.pipeline_parallel);
+
+    if (model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+        LLAMA_LOG_WARN("%s: expert cache disabled: per-device expert pools require --split-mode layer\n", __func__);
+        report_status("disabled", "unsupported-split-mode", 0, 0, 0, pool_cap, "none");
+        return;
+    }
+
+    auto backend_id_for_dev = [&](ggml_backend_dev_t dev) -> int {
+        for (size_t i = 0; i < backends.size(); ++i) {
+            if (ggml_backend_get_device(backends[i].get()) == dev) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+    auto device_index_for_dev = [&](ggml_backend_dev_t dev) -> int {
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            if (model.devices[i].dev == dev) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+
+    struct expert_pool_candidate {
+        ggml_tensor * w;
+        size_t n_expert;
+        size_t expert_size;
+        uint32_t routing_width;
+        size_t layer;
+        int owner_backend_id;
+    };
+    std::vector<expert_pool_candidate> candidates;
+
+    std::vector<int> layer_owner(model.layers.size(), -1);
+    std::vector<uint8_t> layer_offloaded(model.layers.size(), 0);
+    std::vector<ggml_tensor *> conflicted;
+
+    for (size_t il = 0; il < model.layers.size(); ++il) {
+        ggml_backend_dev_t owner_dev = model.dev_layer((int) il);
+        const int owner_idx = device_index_for_dev(owner_dev);
+        const int owner_bid = owner_idx < 0 ? -1 : backend_id_for_dev(owner_dev);
+        // a model device always has a scheduler backend (built in the context constructor)
+        GGML_ASSERT(owner_idx < 0 || owner_bid >= 0);
+        if (owner_idx >= 0) {
+            layer_owner[il] = owner_idx;
+        }
+
+        const auto & layer = model.layers[il];
+        std::vector<ggml_tensor *> tensors;
+        if (layer.ffn_gate_up_exps != nullptr) {
+            tensors.push_back(layer.ffn_gate_up_exps);
+        } else {
+            if (layer.ffn_up_exps   != nullptr) tensors.push_back(layer.ffn_up_exps);
+            if (layer.ffn_gate_exps != nullptr) tensors.push_back(layer.ffn_gate_exps);
+        }
+        if (layer.ffn_down_exps != nullptr) {
+            tensors.push_back(layer.ffn_down_exps);
+        }
+
+        for (ggml_tensor * w : tensors) {
+            if (w == nullptr || w->buffer == nullptr || !ggml_backend_buffer_is_host(w->buffer)) {
+                continue;
+            }
+            layer_offloaded[il] = 1;
+            if (w->ne[2] <= 1 || (uint64_t) w->ne[2] > std::numeric_limits<size_t>::max()) {
+                LLAMA_LOG_INFO("%s: skip '%s': invalid expert count\n", __func__, w->name);
+                continue;
+            }
+            if (owner_idx < 0) {
+                // CPU-owned expert layers keep the host path; the per-device pools only
+                // cover layers that run on a GPU
+                LLAMA_LOG_INFO("%s: skip '%s': layer %zu is CPU-owned\n", __func__, w->name, il);
+                continue;
+            }
+            if (std::find(conflicted.begin(), conflicted.end(), w) != conflicted.end()) {
+                continue;
+            }
+
+            const size_t n_expert = (size_t) w->ne[2];
+            const uint32_t routing_width = model.hparams.n_expert_used((uint32_t) il);
+            bool duplicate = false;
+            for (auto & candidate : candidates) {
+                if (candidate.w != w) {
+                    continue;
+                }
+                duplicate = true;
+                if (candidate.owner_backend_id != owner_bid) {
+                    // D: one pool cannot serve layers on different devices; disable admission
+                    // for this tensor and keep all its layers on the host path
+                    LLAMA_LOG_WARN("%s: '%s' is shared by layers on different devices; not pooling it\n", __func__, w->name);
+                    candidate.w = nullptr;
+                    conflicted.push_back(w);
+                }
+                break;
+            }
+            if (duplicate) {
+                continue;
+            }
+            candidates.push_back({ w, n_expert, w->nb[2], routing_width, il, owner_bid });
+        }
+    }
+
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+            [](const expert_pool_candidate & c) { return c.w == nullptr; }), candidates.end());
+
+    // cache membership: -mcr when given (authoritative), else derived from layer ownership.
+    // validate before any early return so a malformed -mcr is never silently ignored
+    llama_moe_cache_range ranges;
+    ranges.lo.assign(n_dev, -1);
+    ranges.hi.assign(n_dev, -1);
+    if (!cparams.moe_cache_range.empty()) {
+        std::string err;
+        if (!llama_moe_cache_range_parse(cparams.moe_cache_range, (int) n_dev, ranges, err) ||
+            !llama_moe_cache_range_validate(ranges, layer_owner, layer_offloaded, (int) model.layers.size(), (int) n_dev, err)) {
+            throw std::runtime_error("--moe-cache-range: " + err);
+        }
+    } else {
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            if (layer_offloaded[il] && layer_owner[il] >= 0) {
+                const int d = layer_owner[il];
+                if (ranges.lo[d] < 0) {
+                    ranges.lo[d] = (int) il;
+                }
+                ranges.hi[d] = (int) il;
+            }
+        }
+    }
+
+    // honor the declared membership (validated to equal the offloaded GPU-owned set)
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+            [&](const expert_pool_candidate & c) {
+                const int d = layer_owner[c.layer];
+                return d < 0 || ranges.lo[d] < 0 || (int) c.layer < ranges.lo[d] || (int) c.layer > ranges.hi[d];
+            }), candidates.end());
+
+    if (candidates.empty()) {
+        LLAMA_LOG_WARN("%s: expert cache had no effect: no offloaded GPU-owned MoE expert weight tensors found\n", __func__);
+        report_status("disabled", "no-offloaded-experts", 0, 0, 0, pool_cap, "none");
+        return;
+    }
+
+    // all pool-owning devices must share a backend architecture
+    {
+        std::string arch;
+        bool mixed = false;
+        for (const auto & candidate : candidates) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(
+                    ggml_backend_sched_get_backend(sched.get(), candidate.owner_backend_id));
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const char * name = reg != nullptr ? ggml_backend_reg_name(reg) : "unknown";
+            if (arch.empty()) {
+                arch = name;
+            } else if (arch != name) {
+                mixed = true;
+                break;
+            }
+        }
+        if (mixed) {
+            LLAMA_LOG_WARN("%s: expert cache disabled: pool-owning devices use different backend architectures\n", __func__);
+            report_status("disabled", "mixed-arch", 0, 0, 0, pool_cap, "none");
+            return;
+        }
+    }
+
+    std::vector<uint8_t> dev_used(n_dev, 0);
+    for (const auto & candidate : candidates) {
+        const int d = layer_owner[candidate.layer];
+        GGML_ASSERT(d >= 0 && (size_t) d < n_dev);
+        dev_used[d] = 1;
+    }
+
+    // per-device budget: the rail is per device, the cap is a global total split across
+    // pool-owning devices in proportion to their rail-derived budgets
+    constexpr size_t future_reserve = 180158464ull; // post-load to post-decode lazy growth
+    std::vector<size_t>  dev_ceiling(n_dev, 0);
+    std::vector<size_t>  dev_rail_budget(n_dev, 0);
+    std::vector<size_t>  dev_cap_share(n_dev, 0);
+    std::vector<uint8_t> dev_memory_valid(n_dev, 0);
+    size_t sum_rail_budget = 0;
+    size_t pool_device_count = 0;
+
+    for (size_t d = 0; d < n_dev; ++d) {
+        if (!dev_used[d]) {
+            continue;
+        }
+        pool_device_count++;
+        ggml_backend_dev_t dev = model.devices[d].dev;
+        size_t dev_free = 0;
+        size_t dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        bool valid = dev_total != 0 && dev_free <= dev_total && rail_bytes < dev_total;
+        if (valid) {
+            const size_t used_now = dev_total - dev_free;
+            valid = future_reserve <= std::numeric_limits<size_t>::max() - used_now;
+            if (valid) {
+                const size_t ceiling_d = dev_total - rail_bytes;
+                const size_t used_plus_reserve = used_now + future_reserve;
+                valid = ceiling_d >= used_plus_reserve;
+                if (valid) {
+                    dev_ceiling[d] = ceiling_d;
+                    dev_rail_budget[d] = ceiling_d - used_plus_reserve;
+                }
+            }
+        }
+        if (!valid) {
+            LLAMA_LOG_WARN("%s: expert pool device=%s admits nothing: invalid or unavailable device memory report\n",
+                    __func__, ggml_backend_dev_name(dev));
+            continue;
+        }
+        dev_memory_valid[d] = 1;
+        sum_rail_budget += dev_rail_budget[d];
+    }
+
+    if (cap_set && sum_rail_budget > 0) {
+        size_t assigned = 0;
+        for (size_t d = 0; d < n_dev; ++d) {
+            if (!dev_memory_valid[d]) {
+                continue;
+            }
+            const long double share = ((long double) pool_cap * (long double) dev_rail_budget[d]) / (long double) sum_rail_budget;
+            dev_cap_share[d] = (size_t) share;
+            assigned += dev_cap_share[d];
+        }
+        size_t remainder = pool_cap > assigned ? pool_cap - assigned : 0;
+        for (size_t d = 0; d < n_dev && remainder > 0; ++d) {
+            if (!dev_memory_valid[d]) {
+                continue;
+            }
+            dev_cap_share[d]++;
+            remainder--;
+        }
+    }
+
+    std::vector<size_t> dev_budget(n_dev, 0);
+    size_t dev_budget_total = 0;
+    for (size_t d = 0; d < n_dev; ++d) {
+        if (!dev_memory_valid[d]) {
+            continue;
+        }
+        const size_t bound = cap_set ? dev_cap_share[d] : std::numeric_limits<size_t>::max();
+        dev_budget[d] = std::min(bound, dev_rail_budget[d]);
+        if (dev_used[d]) {
+            dev_budget_total += dev_budget[d];
+        }
+    }
+
+    LLAMA_LOG_WARN("expert pool limits cap_mib=%s rail_mib=%zu cap_bytes=%zu (env LLAMA_MOE_POOL_CAP_MIB / LLAMA_MOE_POOL_RAIL_MIB, defaults none / 2879; rail is per device)\n",
+            cap_set ? std::to_string(cap_mib).c_str() : "none", rail_mib, pool_cap);
+    if (cap_set) {
+        LLAMA_LOG_INFO("%s: expert pool cap: global=%zu bytes divided over %zu pool-owning devices\n", __func__, pool_cap, pool_device_count);
+        for (size_t d = 0; d < n_dev; ++d) {
+            if (!dev_used[d]) {
+                continue;
+            }
+            LLAMA_LOG_INFO("%s: expert pool cap share device=%s budget=%zu ceiling=%zu rail_budget=%zu\n",
+                    __func__, ggml_backend_dev_name(model.devices[d].dev), dev_budget[d], dev_ceiling[d], dev_rail_budget[d]);
+        }
+    }
+
+    // group, plan and register per device
+    std::vector<size_t> actual_device_by_dev(n_dev, 0);
+    std::vector<size_t> pools_by_dev(n_dev, 0);
+    std::vector<size_t> slots_by_dev(n_dev, 0);
+    std::vector<size_t> bytes_by_dev(n_dev, 0);
+    std::vector<size_t> all_plan_slots;
+    size_t actual_device_total = 0;
+    size_t actual_host_total = 0;
+    size_t requested_total = 0;
+    size_t planned_total = 0;
+    size_t selected_max = 0;
+
+    for (size_t d = 0; d < n_dev; ++d) {
+        if (!dev_used[d]) {
+            continue;
+        }
+        std::vector<size_t> group;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if ((size_t) layer_owner[candidates[i].layer] == d) {
+                group.push_back(i);
+            }
+        }
+        if (group.empty()) {
+            continue;
+        }
+
+        const size_t requested = per_device_slots ? (size_t) cparams.expert_cache_slots_per_device[d]
+                                                  : (size_t) cparams.expert_cache_slots;
+        selected_max = std::max(selected_max, requested);
+        const size_t budget_d = dev_budget[d];
+        const int owner_bid = backend_id_for_dev(model.devices[d].dev);
+        GGML_ASSERT(owner_bid >= 0);
+
+        const size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_sched_get_buffer_type(
+                sched.get(), ggml_backend_sched_get_backend(sched.get(), owner_bid)));
+
+        std::vector<struct ggml_backend_expert_pool_candidate> plan_candidates;
+        for (const size_t i : group) {
+            const auto & c = candidates[i];
+            plan_candidates.push_back({ c.n_expert, c.expert_size, c.routing_width, profile_weights[c.layer] });
+        }
+        std::vector<size_t> plan_slots(group.size(), 0);
+        struct ggml_backend_expert_pool_plan plan = {};
+        if (budget_d == 0 || !ggml_backend_expert_pool_plan_weighted(plan_candidates.data(), plan_candidates.size(),
+                requested, budget_d, alignment, plan_slots.data(), &plan)) {
+            LLAMA_LOG_WARN("%s: expert pool device=%s admits nothing: no legal slot distribution (budget=%zu requested=%zu)\n",
+                    __func__, ggml_backend_dev_name(model.devices[d].dev), budget_d, requested);
+            continue;
+        }
+
+        requested_total += requested * group.size();
+        planned_total += plan.total_slots;
+        bytes_by_dev[d] += plan.device_bytes;
+
+        for (size_t k = 0; k < group.size(); ++k) {
+            const auto & c = candidates[group[k]];
+            const size_t slots_i = plan_slots[k];
+            GGML_ASSERT(ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), c.owner_backend_id)) ==
+                    model.dev_layer((int) c.layer));
+
+            struct ggml_backend_expert_pool_candidate one_candidate = { c.n_expert, c.expert_size, c.routing_width, profile_weights[c.layer] };
+            struct ggml_backend_expert_pool_plan one_plan = {};
+            if (!ggml_backend_expert_pool_plan_uniform(&one_candidate, 1, slots_i, slots_i,
+                    std::numeric_limits<size_t>::max(), alignment, &one_plan)) {
+                LLAMA_LOG_WARN("%s: expert cache disabled: checked allocation sizing failed for '%s'\n", __func__, c.w->name);
+                ggml_backend_sched_clear_expert_pools(sched.get());
+                expert_pools.clear();
+                report_status("disabled", "allocation-sizing-failed", 0, 0, 0, budget_d, "none");
+                return;
+            }
+            ggml_tensor * table = nullptr;
+            size_t actual_device = 0;
+            size_t actual_host = 0;
+            ggml_tensor * pool = ggml_backend_sched_register_expert_pool_with_reservation(sched.get(), c.w,
+                    c.owner_backend_id, (int) slots_i, one_plan.device_bytes, &actual_device, &actual_host, &table);
+            if (pool == nullptr || actual_device > one_plan.device_bytes ||
+                actual_device_total > std::numeric_limits<size_t>::max() - actual_device ||
+                actual_host_total > std::numeric_limits<size_t>::max() - actual_host) {
+                LLAMA_LOG_WARN("%s: expert cache disabled: registration failed for '%s'; rolling back complete admission\n",
+                        __func__, c.w->name);
+                ggml_backend_sched_clear_expert_pools(sched.get());
+                expert_pools.clear();
+                report_status("disabled", "registration-failed", 0, 0, 0, budget_d, "none");
+                return;
+            }
+            actual_device_total += actual_device;
+            actual_host_total += actual_host;
+            actual_device_by_dev[d] += actual_device;
+            pools_by_dev[d] += 1;
+            slots_by_dev[d] += slots_i;
+            all_plan_slots.push_back(slots_i);
+            expert_pools.emplace(c.w, llama_expert_pool{pool, table, c.owner_backend_id, false});
+            LLAMA_LOG_INFO("%s: registered '%s' on %s: %zu slots planned_device=%zu actual_device=%zu actual_host=%zu\n",
+                    __func__, c.w->name, ggml_backend_dev_name(model.devices[d].dev), slots_i, one_plan.device_bytes, actual_device, actual_host);
+        }
+    }
+
+    if (expert_pools.empty()) {
+        report_status("disabled", "admission-failed", 0, 0, 0, pool_cap, "none");
+        return;
+    }
+
+    for (size_t d = 0; d < n_dev; ++d) {
+        if (dev_used[d] && actual_device_by_dev[d] > dev_budget[d]) {
+            LLAMA_LOG_WARN("%s: expert cache disabled: device=%s actual bytes %zu exceeded budget %zu; rolling back complete admission\n",
+                    __func__, ggml_backend_dev_name(model.devices[d].dev), actual_device_by_dev[d], dev_budget[d]);
+            ggml_backend_sched_clear_expert_pools(sched.get());
+            expert_pools.clear();
+            report_status("disabled", "actual-bytes-exceeded-budget", 0, 0, actual_device_total, dev_budget[d], "none");
+            return;
+        }
+    }
+
+    if (!all_plan_slots.empty()) {
+        slots_min = *std::min_element(all_plan_slots.begin(), all_plan_slots.end());
+        slots_max = *std::max_element(all_plan_slots.begin(), all_plan_slots.end());
+        std::sort(all_plan_slots.begin(), all_plan_slots.end());
+        slots_med = all_plan_slots[all_plan_slots.size() / 2];
+        for (const size_t s : all_plan_slots) {
+            total_slots += s;
+        }
+    }
+    for (size_t d = 0; d < n_dev; ++d) {
+        if (!dev_used[d]) {
+            continue;
+        }
+        ceiling = std::max(ceiling, dev_ceiling[d]);
+        LLAMA_LOG_INFO("%s: expert pool device=%s pools=%zu slots=%zu bytes=%zu budget=%zu ceiling=%zu allocated=%zu\n",
+                __func__, ggml_backend_dev_name(model.devices[d].dev), pools_by_dev[d], slots_by_dev[d],
+                bytes_by_dev[d], dev_budget[d], dev_ceiling[d], actual_device_by_dev[d]);
+    }
+
+    const char * limited_by = "rail";
+    if (requested_total > 0 && planned_total == requested_total) {
+        limited_by = "slots";
+    } else if (cap_set) {
+        limited_by = "cap";
+    }
+
+    LLAMA_LOG_INFO("%s: expert cache enabled: devices=%zu pools=%zu alloc=%s profile=%s selected_max=%zu total_slots=%zu actual_device=%zu actual_host=%zu budget=%zu ceiling=%zu\n",
+            __func__, pool_device_count, expert_pools.size(), alloc_kind, profile_state, selected_max, total_slots,
+            actual_device_total, actual_host_total, dev_budget_total, ceiling);
+    init_fallback_state();
+    report_status("enabled", "admitted", selected_max, expert_pools.size(), actual_device_total, dev_budget_total, limited_by);
 }
 
 static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
@@ -2060,53 +2537,98 @@ void llama_context::update_expert_pool_fallback() {
         return;
     }
 
-    long long hits   = 0;
-    long long misses = 0;
-    ggml_backend_sched_get_expert_pool_stats(sched.get(), &hits, &misses, nullptr);
-
-    // only count graph executions that actually engaged the pool: prefill and oversized
-    // ubatches bypass it, so their runs leave the counters untouched
-    if (hits == expert_pool_fallback_last_hits && misses == expert_pool_fallback_last_misses) {
-        return;
+    const size_t n_backends = backends.size();
+    if (expert_pool_fallback_last_hits.size() != n_backends) {
+        return; // not initialized (no admitted pools)
     }
-
-    // per-decode deltas, so the cold-start window cannot dominate the decision
-    const long long d_hits   = hits   - expert_pool_fallback_last_hits;
-    const long long d_misses = misses - expert_pool_fallback_last_misses;
-    expert_pool_fallback_last_hits   = hits;
-    expert_pool_fallback_last_misses = misses;
-    expert_pool_fallback_decodes++;
 
     // warm-up: the pool needs a window of decode steps before its hit rate is meaningful
     constexpr int64_t warmup_decodes = 64;
-    if (expert_pool_fallback_decodes <= warmup_decodes) {
-        return;
-    }
-
-    const long long d_total = d_hits + d_misses;
-    if (d_total <= 0) {
-        return;
-    }
-    const double rate = 100.0 * (double) d_hits / (double) d_total;
-
-    if (rate >= (double) cparams.expert_pool_fallback) {
-        expert_pool_fallback_below = 0;
-        return;
-    }
-
     // require a few consecutive below-threshold decodes so one noisy step does not trip it
     constexpr int64_t consecutive = 3;
-    if (++expert_pool_fallback_below < consecutive) {
-        return;
+
+    bool engaged = false;
+    bool tripped_any = false;
+
+    // each pool-owning device is judged on its own hit rate: a hot device must not mask a
+    // cold one (Plan B invariant E)
+    for (size_t b = 0; b < n_backends; ++b) {
+        if (!expert_pool_fallback_owning[b]) {
+            continue;
+        }
+
+        long long hits = 0;
+        long long misses = 0;
+        ggml_backend_sched_get_expert_pool_stats_by_backend(sched.get(), (int) b, &hits, &misses, nullptr);
+
+        // only count graph executions that actually engaged this device's pools: prefill and
+        // oversized ubatches bypass them, so their runs leave the counters untouched
+        if (hits == expert_pool_fallback_last_hits[b] && misses == expert_pool_fallback_last_misses[b]) {
+            continue;
+        }
+
+        const long long d_hits = hits - expert_pool_fallback_last_hits[b];
+        const long long d_misses = misses - expert_pool_fallback_last_misses[b];
+        expert_pool_fallback_last_hits[b] = hits;
+        expert_pool_fallback_last_misses[b] = misses;
+        // count one decode step when the first pool-owning device engages, before the
+        // warm-up gate, matching the pre-Plan-B order (rate first evaluated on decode 65)
+        if (!engaged) {
+            expert_pool_fallback_decodes++;
+            engaged = true;
+        }
+
+        if (expert_pool_fallback_tripped[b]) {
+            continue;
+        }
+        if (expert_pool_fallback_decodes <= warmup_decodes) {
+            continue;
+        }
+
+        const long long d_total = d_hits + d_misses;
+        if (d_total <= 0) {
+            continue;
+        }
+        const double rate = 100.0 * (double) d_hits / (double) d_total;
+        if (rate >= (double) cparams.expert_pool_fallback) {
+            expert_pool_fallback_below[b] = 0;
+            continue;
+        }
+        if (++expert_pool_fallback_below[b] < consecutive) {
+            continue;
+        }
+
+        // trip only this device: disable its pools and keep the other devices pooling
+        expert_pool_fallback_tripped[b] = true;
+        tripped_any = true;
+        for (auto & entry : expert_pools) {
+            if (entry.second.backend_id == (int) b) {
+                entry.second.disabled = true;
+            }
+        }
+        LLAMA_LOG_WARN("%s: expert pool device=%s disabled: window hit rate %.1f%% below threshold %d%% after %lld decode steps, using the host path for its layers\n",
+                __func__, ggml_backend_dev_name(ggml_backend_get_device(ggml_backend_sched_get_backend(sched.get(), (int) b))),
+                rate, cparams.expert_pool_fallback, (long long) expert_pool_fallback_decodes);
+
+        bool all_tripped = true;
+        for (size_t b2 = 0; b2 < n_backends; ++b2) {
+            if (expert_pool_fallback_owning[b2] && !expert_pool_fallback_tripped[b2]) {
+                all_tripped = false;
+                break;
+            }
+        }
+        if (all_tripped) {
+            expert_pool_diagnostic_state->disabled.store(true);
+            if (!expert_pool_diagnostic_state->fallback_reported.exchange(true)) {
+                LLAMA_LOG_WARN("%s: expert pool disabled on all pool-owning devices, using the host path for the rest of the context\n", __func__);
+            }
+        }
     }
 
-    expert_pool_diagnostic_state->disabled.store(true);
-    // the decode graph is reused across steps; drop the cached graph so the next step rebuilds
-    // it and actually takes the host-weight path instead of the pooled one
-    gf_res_prev_active = nullptr;
-    if (!expert_pool_diagnostic_state->fallback_reported.exchange(true)) {
-        LLAMA_LOG_WARN("%s: expert pool disabled: window hit rate %.1f%% below threshold %d%% after %lld decode steps, using the host path for the rest of the context\n",
-                __func__, rate, cparams.expert_pool_fallback, (long long) expert_pool_fallback_decodes);
+    if (tripped_any) {
+        // the decode graph is reused across steps; drop the cached graph so the next step
+        // rebuilds it and takes the host-weight path for the disabled pools
+        gf_res_prev_active = nullptr;
     }
 }
 
@@ -4129,6 +4651,9 @@ llama_context_params llama_context_default_params() {
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
         /*.expert_pool_fallback        =*/ 0,
+        /*.expert_cache_slots_per_device =*/ nullptr,
+        /*.expert_cache_slots_per_device_count =*/ 0,
+        /*.moe_cache_range             =*/ nullptr,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

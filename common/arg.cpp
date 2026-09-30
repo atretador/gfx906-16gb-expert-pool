@@ -2771,17 +2771,53 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"-mec", "--moe-expert-cache"}, "N",
-        "keep a cache of N experts per offloaded MoE weight tensor in VRAM\n"
+        {"-mec", "--moe-expert-cache"}, "N or N0,N1,...",
+        "keep a cache of N experts per offloaded MoE weight tensor in VRAM; with a\n"
+        "comma-separated list each device gets its own count in device order (one value\n"
+        "applies to every device)\n"
         "hot experts are served from VRAM across decode steps, only cache misses are\n"
         "copied from the CPU (requires --cpu-moe/--n-cpu-moe or tensor overrides, 0 = off)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_slots = 0;
+            params.expert_cache_slots_per_device.clear();
+            size_t start = 0;
+            while (true) {
+                const size_t comma = value.find(',', start);
+                const std::string tok = comma == std::string::npos ? value.substr(start) : value.substr(start, comma - start);
+                if (tok.empty()) {
+                    throw std::invalid_argument("invalid value");
+                }
+                for (const char c : tok) {
+                    if (c < '0' || c > '9') {
+                        throw std::invalid_argument("invalid value");
+                    }
+                }
+                const long v = std::strtol(tok.c_str(), nullptr, 10);
+                if (v < 0 || v > INT32_MAX) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.expert_cache_slots_per_device.push_back((int32_t) v);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
             }
-            params.expert_cache_slots = value;
+            if (params.expert_cache_slots_per_device.size() == 1) {
+                params.expert_cache_slots = params.expert_cache_slots_per_device[0];
+                params.expert_cache_slots_per_device.clear();
+            }
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"-mcr", "--moe-cache-range"}, "\"lo-hi,lo-hi,...\"",
+        "declare the per-device cached layer ranges for the expert cache, in device order;\n"
+        "authoritative: the ranges must partition the offloaded GPU-owned layers, a '-' entry\n"
+        "means that device caches nothing, and any mismatch is a hard error (requires\n"
+        "--moe-expert-cache greater than 0)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_range = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_RANGE"));
     add_opt(common_arg(
         {"-mpf", "--moe-pool-fallback"}, "PCT",
         "disable the MoE expert cache for the rest of the context when its decode hit rate\n"

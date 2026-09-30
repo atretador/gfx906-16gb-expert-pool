@@ -786,6 +786,7 @@ struct ggml_backend_sched_expert_pool {
     ggml_backend_buffer_t table_buf;
     ggml_backend_buffer_t table_dev_buf;
     ggml_backend_t backend;  // backend hosting the pool
+    int backend_id;          // index of `backend` in the scheduler backend list
 
     int n_expert;
     int n_slots;
@@ -1802,6 +1803,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // needs no scheduler copy matching
                         if (ep.table_dev == node->src[0]) {
                             anchor_hit = true;
+                            // the WEIGHTS usage pins this remap to the pool owner, so the
+                            // update below writes the table this split actually reads
+                            GGML_ASSERT(split_backend == ep.backend && "expert pool remap scheduled off its owner backend");
                             const struct ggml_tensor * ids = node->src[1];
                             while (ids != NULL && ids->op == GGML_OP_RESHAPE) {
                                 ids = ids->src[0];
@@ -2658,6 +2662,10 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool_with_reservation(
         GGML_LOG_ERROR("%s: failed to allocate the device map table for '%s'\n", __func__, w->name);
         return NULL;
     }
+    // pin the remap GET_ROWS to the pool owner: the WEIGHTS usage makes pass 1 place the
+    // remap on the backend that can access the table, so the update writes the table the
+    // remap actually reads. without it a scheduler copy of the table may be read instead
+    ggml_backend_buffer_set_usage(table_dev_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     const size_t actual_pool_bytes = ggml_backend_buffer_get_size(pool_buf);
     const size_t actual_table_bytes = ggml_backend_buffer_get_size(table_buf);
@@ -2724,6 +2732,7 @@ struct ggml_tensor * ggml_backend_sched_register_expert_pool_with_reservation(
     ep.table_buf     = table_buf;
     ep.table_dev_buf = table_dev_buf;
     ep.backend   = backend;
+    ep.backend_id = backend_id;
     ep.n_expert  = n_expert;
     ep.n_slots   = n_slots;
     ep.expert_size = esz;
@@ -2809,6 +2818,41 @@ void ggml_backend_sched_get_expert_pool_stats(
         return;
     }
     for (const auto & ep : sched->expert_pools) {
+        if (hits != NULL) {
+            *hits += (long long) ep.n_hits;
+        }
+        if (misses != NULL) {
+            *misses += (long long) ep.n_misses;
+        }
+        if (copy_bytes != NULL) {
+            *copy_bytes += (long long) ep.n_copy_bytes;
+        }
+    }
+}
+
+void ggml_backend_sched_get_expert_pool_stats_by_backend(
+        const ggml_backend_sched_t sched,
+        int backend_id,
+        long long * hits,
+        long long * misses,
+        long long * copy_bytes) {
+    if (hits != NULL) {
+        *hits = 0;
+    }
+    if (misses != NULL) {
+        *misses = 0;
+    }
+    if (copy_bytes != NULL) {
+        *copy_bytes = 0;
+    }
+    if (sched == NULL) {
+        return;
+    }
+    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+    for (const auto & ep : sched->expert_pools) {
+        if (ep.backend_id != backend_id) {
+            continue;
+        }
         if (hits != NULL) {
             *hits += (long long) ep.n_hits;
         }

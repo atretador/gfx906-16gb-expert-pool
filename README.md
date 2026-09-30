@@ -33,7 +33,18 @@ The pool is not the win by itself. The admission fix is what turns "0 tensors fi
   `AD-3.84bpw-IQ4_XS-M64`.
 - ROCm/gfx906 build base: [mixa3607/ML-gfx906](https://github.com/mixa3607/ML-gfx906).
 
-## Build (gfx906 / ROCm)
+## Build
+
+The expert pool is backend-agnostic: it lives in `ggml/src/ggml-backend.cpp` and
+`src/llama-context.cpp` and uses only generic backend/buffer APIs, so it is not tied to ROCm. It has
+been built and exercised on ROCm/HIP (gfx906) and on Vulkan (gfx906 + gfx802). CUDA uses the same
+code path but has not been exercised here.
+
+Common to every backend: build with CMake + Ninja, `-DCMAKE_BUILD_TYPE=Release`, and
+`-DLLAMA_CURL=OFF` if you do not need the Hugging Face downloader. The `llama-server` and
+`test-expert-pool` targets are what you need.
+
+### ROCm / HIP (gfx906)
 
 `docker/Dockerfile` builds against a pinned ROCm/gfx906 base image and compiles the fork with
 `-DGGML_HIP=ON -DGPU_TARGETS=gfx906`:
@@ -42,8 +53,39 @@ The pool is not the win by itself. The admission fix is what turns "0 tensors fi
 docker build -f docker/Dockerfile -t local/llama.cpp-gfx906:expert-pool .
 ```
 
+Native build:
+
+```sh
+cmake -B build -G Ninja -DGGML_HIP=ON -DGPU_TARGETS=gfx906 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel --target llama-server test-expert-pool
+```
+
 The image records the source commit and a source-tree digest in `/etc/llama.cpp-provenance`, so a
 built image can be tied back to an exact tree.
+
+### Vulkan
+
+Needs a Vulkan loader, a vendor ICD, and `glslc` (the shader compiler).
+
+```sh
+cmake -B build-vulkan -G Ninja -DGGML_VULKAN=ON -DGGML_HIP=OFF -DGGML_CUDA=OFF \
+  -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan --parallel --target llama-server test-expert-pool llama-bench
+```
+
+`llama-server --list-devices` prints the Vulkan devices and their free VRAM. Vulkan device order is
+independent of the ROCm order and is often reversed, so always check `--list-devices` before writing
+`--tensor-split`.
+
+### CUDA
+
+```sh
+cmake -B build-cuda -G Ninja -DGGML_CUDA=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda --parallel --target llama-server test-expert-pool
+```
+
+Add `-DCMAKE_CUDA_ARCHITECTURES=native` (or an explicit list) if the default architecture set does
+not match your cards. Multi-GPU CUDA has not been exercised by the maintainers.
 
 ## Usage
 
@@ -53,7 +95,9 @@ llama-server -m <model.gguf> --n-cpu-moe 48 -ngl 99 -c 131072 \
 ```
 
 - `--moe-expert-cache N` / `-mec N`: requested pool slots **per offloaded expert weight tensor**
-  (not a global count, not tokens). Each tensor gets its own pool. `0` disables the pool.
+  (not a global count, not tokens). Each tensor gets its own pool. `0` disables the pool. With more
+  than one device, a comma-separated list (`-mec N0,N1,...`) sets a per-device count in device order;
+  a single value applies to every device. See the multi-GPU section below.
 - `--moe-pool-fallback PCT` / `-mpf PCT`: disable the pool for the rest of the context once its
   decode hit rate stays below `PCT` percent after a warm-up window. The stock host-weight path
   still streams the used experts, just without the pool readbacks and table uploads. `0` (default)
@@ -116,6 +160,179 @@ expert pool runtime reason=shutdown hits=... misses=... evictions=... hit_rate=.
 `limited_by` says what actually constrained admission (`slots`, `rail` or `cap`), and `copy_bytes` is
 the number of bytes copied on misses. Watch `copy_bytes`, not the hit-rate percentage: a slot moved
 to a cheaper tensor raises the hit count while increasing bytes moved.
+
+## Multi-GPU: per-device expert pools
+
+The single-device pool keeps every tensor's cache on one accelerator. In multi-GPU mode each GPU
+pools only the offloaded expert tensors of the layers it owns:
+
+```
+cache_range(gpu i) = layers_owned_by(gpu i)  INTERSECT  host_offloaded_layers
+```
+
+Each pool still lives entirely on one device (the device that owns its layer), and the pooled
+`MUL_MAT_ID` plus its expert-id remap run on that same device. Experts never move between GPUs:
+there is no demotion and no cross-device pool copy. Layer ownership comes from the normal layer
+split (`--split-mode layer` with `--tensor-split`); the offloaded set comes from `--cpu-moe` /
+`--n-cpu-moe` / `--override-tensor`.
+
+This is a capacity feature. The extra GPU buys more aggregate cache slots, which raises the hit rate
+and removes host round trips. It does not reduce the per-copy cost, and the pipeline scheduler stays
+off, so layer boundaries still copy activations between devices.
+
+### Required parameters
+
+- `--split-mode layer` (`-sm layer`): required whenever more than one device is present. `row` and
+  `tensor` are rejected for the pool (a layer's experts would be split across devices, so a single
+  owner device is undefined) and the pool disables with `reason=unsupported-split-mode`.
+- A host offload so there are pool candidates: `--cpu-moe` (`-cmoe`, all layers), `--n-cpu-moe N`
+  (first N layers) or `--override-tensor "pattern=CPU"` (exact ranges). Without one the pool
+  disables with `reason=no-offloaded-experts`.
+- `--moe-expert-cache N` (`-mec N`), or the per-device list `-mec N0,N1,...` with exactly
+  `n_devices` entries (a count mismatch is a hard error). A single value applies to every device.
+- `--tensor-split` (`-ts`) when the GPUs differ in VRAM, so the layer split matches capacity.
+
+The pooled layer set must span the split boundary. `--n-cpu-moe` is a prefix, so a prefix that falls
+entirely inside the first GPU's layer range puts every pool on that one GPU and silently degenerates
+to single-device. `--cpu-moe` always spans. Confirm with the per-device status lines below.
+
+### Optional parameters
+
+- `--moe-cache-range "lo-hi,lo-hi,..."` (`-mcr`): declare the per-device cached layer ranges
+  explicitly, in device order. Authoritative: the ranges must partition the offloaded GPU-owned
+  layers, and a `-` entry means that device caches nothing. Any mismatch is a hard error, never a
+  silent clip.
+- `--moe-pool-fallback PCT` (`-mpf`): per-device warmth gate. A device whose decode hit rate stays
+  below `PCT` is disabled on its own; the global disable only happens when every pool-owning device
+  has tripped, so a hot device cannot mask a cold one.
+
+### Worked examples
+
+Two GPUs, homogeneous, all experts offloaded (simplest working config):
+
+```sh
+llama-server -m <model.gguf> --host 127.0.0.1 --port 8080 \
+  -ngl 99 -sm layer -ts 1,1 -c 8192 -fa on \
+  -cmoe -mec 80
+```
+
+Two GPUs, offload a layer prefix and pool it across both cards. 48-layer model, boundary at layer 10.
+The split denominator is `n_layer_all + 1` (the output layer is included), so the boundary is
+`-ts 10,39`, not `10,38`:
+
+```sh
+llama-server -m <model.gguf> -ngl 99 -sm layer -ts 10,39 --n-cpu-moe 20 \
+  -c 8192 -fa on -mec 40 -mcr "0-9,10-19"
+```
+
+`-ts 10,38` would make layer 10 GPU0-owned, so `-mcr "0-9,10-19"` would hard-error. Use `10,39`, or
+declare the ranges the split actually produces.
+
+Two GPUs, unequal VRAM, explicit per-device slot counts. GPU0 gets a small cache, GPU1 a large one:
+
+```sh
+llama-server -m <model.gguf> -ngl 99 -sm layer -ts 1,3 -cmoe \
+  -c 8192 -fa on -mec 24,72
+```
+
+Three GPUs, different VRAM (10 GB + 8 GB + 8 GB). A single `-mec` value applies to every device:
+
+```sh
+llama-server -m <model.gguf> -ngl 99 -sm layer -ts 10,8,8 -cmoe \
+  -c 8192 -fa on -mec 48
+```
+
+Same box with a per-device slot list instead, sized to each card:
+
+```sh
+llama-server -m <model.gguf> -ngl 99 -sm layer -ts 10,8,8 -cmoe \
+  -c 8192 -fa on -mec 64,40,40
+```
+
+Three GPUs, homogeneous:
+
+```sh
+llama-server -m <model.gguf> -ngl 99 -sm layer -ts 1,1,1 -cmoe \
+  -c 8192 -fa on -mec 64,64,64
+```
+
+Validated reference run (Vulkan, mixed pair, this fork). The Vulkan device order here is R9 380
+first, so `-ts 1,15` gives the Pro VII the larger share. `-v` is needed for the per-device lines:
+
+```sh
+./build-vulkan/bin/llama-server -m Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf \
+  --host 127.0.0.1 --port 8899 -ngl 99 -c 2048 -b 512 -ub 128 \
+  -sm layer -ts 1,15 --cpu-moe -mec 32 -mpf 0 --jinja -v
+```
+
+This produced 9 pools on Vulkan0 (R9 380) and 111 on Vulkan1 (Pro VII), with coherent output.
+
+Notes for all examples:
+
+- `-ts` is a ratio, not an exact layer count. Check the per-device status lines to see where the
+  layers actually landed before relying on a `-mcr` partition.
+- `-mcr` layer numbers are absolute layer indices; validate them against the split.
+- Add `-v` to see the per-device pool lines; the server suppresses INFO by default.
+- On 8 GB cards lower `LLAMA_MOE_POOL_RAIL_MIB` (for example to 1024); the 2879 MiB default is a large
+  fraction of an 8 GB card.
+
+### `--moe-cache-range` errors
+
+`-mcr` is validated against real ownership and the offload set. All of the following are hard errors
+with a logged message and a nonzero exit, never a silent clip:
+
+- number of entries does not match `n_devices`;
+- malformed entry, `lo > hi`, negative, or `hi` at or above the layer count;
+- a layer in entry `i` is not owned by device `i` (for example `layer 3 in device 0's range is owned
+  by device 1`);
+- a layer is not host-offloaded;
+- overlapping ranges, or a gap between two non-empty ranges;
+- the union does not cover the offloaded GPU-owned layers;
+- `-mcr` combined with an expert cache of `0`.
+
+### Telemetry
+
+The per-device lines are INFO level; run with `-v`, because the server suppresses INFO by default:
+
+```
+expert pool device=Vulkan0 pools=9 slots=288 bytes=165164544 budget=977567744 ceiling=1276116992 allocated=165164544
+expert pool device=Vulkan1 pools=111 slots=3552 bytes=1951832576 budget=12819959808 ceiling=14144241664 allocated=1951832576
+expert cache enabled: devices=2 pools=120 ... actual_device=2116997120 actual_host=122880 ...
+```
+
+`ceiling` is that device's total VRAM minus the rail, `budget` is what remains for the pool, and
+`allocated` is that device's pool plus table bytes. The trailer `expert pool runtime ...` line is
+aggregate across devices.
+
+### Multi-GPU environment knobs
+
+- `LLAMA_MOE_POOL_RAIL_MIB` is **per device**. Default 2879 MiB, hard floor 1024 MiB. On an 8 GB card
+  the default rail is a large fraction of VRAM, so lower it (for example to 1024).
+- `LLAMA_MOE_POOL_CAP_MIB` is a **global total** across all pool-owning devices, split between them
+  in proportion to their rail budgets. It is never multiplied by the device count.
+
+### Multi-GPU notes and limits
+
+- The feature is a capacity play, not a latency play.
+- `--split-mode row` / `tensor` are rejected; MoE tensor parallelism is not supported by the pool.
+- Mixed architectures are only flagged (`reason=mixed-arch`) when the pool-owning devices report
+  different backend registration names. Two different GPUs under one backend (two CUDA compute
+  capabilities, or gfx802 + gfx906 under Vulkan) share a registration name and are **not** flagged.
+  Different architectures compile different kernels, so cross-architecture bitwise output equality
+  is not guaranteed; a same-architecture multi-GPU box keeps the bitwise property.
+- At most `GGML_SCHED_MAX_BACKENDS` (16) backends exist, which bounds N.
+- Speculative draft/MTP forces the pool off, unchanged from single-device.
+
+### Multi-GPU validation status
+
+- Single-device no-op gate: passed. Admission, slot counts, device bytes, hit counters and the output
+  hash are identical to the pre-change build on the single-GPU path.
+- Two-device functional gate: passed on Vulkan with a mixed pair (Radeon Pro VII / gfx906 and
+  R9 380 / gfx802), `Qwen3.6-35B-A3B-IQ4_NL_XL` at 2048 context. Per-device status, exact per-device
+  byte accounting, coherent and run-to-run deterministic output, no asserts. Two-device ownership was
+  confirmed: 9 pools on the small card, 111 on the large one.
+- Not done yet: a same-architecture multi-GPU run (needed for the bitwise pooled-versus-unpooled hash
+  gate), per-device runtime hit-rate log lines, and CUDA multi-GPU at all.
 
 ## Measured results
 
@@ -204,8 +421,10 @@ git rebase upstream/master
 ```
 
 Conflicts are expected in `README.md` (this file replaces upstream's), `common/arg.cpp`,
-`src/llama-context.cpp`, `src/llama-graph.cpp` and `ggml/src/ggml-backend.cpp`. After rebasing,
-rebuild for gfx906 and re-run `test-expert-pool`.
+`common/common.cpp`, `common/common.h`, `include/llama.h`, `src/llama-cparams.h`,
+`src/llama-context.cpp`, `src/llama-context.h`, `src/llama-graph.cpp`, `src/llama-graph.h`,
+`src/llama-moe-cache-range.h` (new file) and `ggml/src/ggml-backend.cpp`. After rebasing, rebuild and
+re-run `test-expert-pool`.
 
 ## License
 

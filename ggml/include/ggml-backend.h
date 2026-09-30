@@ -448,6 +448,15 @@ extern "C" {
         long long * misses,     // may be NULL
         long long * copy_bytes); // may be NULL; bytes of expert slices copied on misses
 
+    // same counters restricted to the pools hosted on backend `backend_id`, so per-device
+    // fallback and status can be computed independently
+    GGML_API void ggml_backend_sched_get_expert_pool_stats_by_backend(
+        const ggml_backend_sched_t sched,
+        int backend_id,
+        long long * hits,       // may be NULL
+        long long * misses,     // may be NULL
+        long long * copy_bytes); // may be NULL
+
     //
     // Meta backend
     //

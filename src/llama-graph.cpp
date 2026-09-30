@@ -1571,7 +1571,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         // (the trip is logged once by llama_context::update_expert_pool_fallback)
     } else if (expert_pools != nullptr) {
         auto it = expert_pools->find(w);
-        if (it != expert_pools->end()) {
+        if (it != expert_pools->end() && !it->second.disabled) {
             const llama_expert_pool & ep = it->second;
             // cur is [n_embd, 1, n_tokens] here (see build_moe_ffn), so the number of
             // experts a single ubatch can select is bounded by ids->ne[0] * cur->ne[2]

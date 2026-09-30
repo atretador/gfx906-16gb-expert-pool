@@ -111,6 +111,8 @@ struct llama_expert_pool_diagnostic_state {
 struct llama_expert_pool {
     ggml_tensor * pool  = nullptr; // expert slot pool on the compute backend (use as MUL_MAT_ID src[0])
     ggml_tensor * table = nullptr; // host I32 tensor mapping expert id -> slot id (graph input)
+    int  backend_id = -1;          // scheduler backend hosting this pool
+    bool disabled   = false;       // per-device fallback: skip this pool, use the host weight path
 };
 
 using llama_expert_pools = std::unordered_map<const ggml_tensor *, llama_expert_pool>;

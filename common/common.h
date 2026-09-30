@@ -476,6 +476,8 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     int32_t expert_cache_slots = 0;     // expert slots cached in VRAM per offloaded MoE weight tensor
     int32_t expert_pool_fallback = 0;   // disable the pool when its decode hit rate stays below this percent (0 = off)
+    std::vector<int32_t> expert_cache_slots_per_device; // per-device expert slots from -mec (empty = scalar applies)
+    std::string moe_cache_range;        // per-device cached layer ranges from -mcr (empty = derive)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model

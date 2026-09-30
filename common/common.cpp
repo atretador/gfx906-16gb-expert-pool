@@ -1669,7 +1669,18 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         });
     cparams.expert_cache_slots = spec_draft ? 0 : params.expert_cache_slots;
     cparams.expert_pool_fallback = spec_draft ? 0 : params.expert_pool_fallback;
-    if (spec_draft && params.expert_cache_slots > 0) {
+    if (spec_draft) {
+        cparams.expert_cache_slots_per_device = nullptr;
+        cparams.expert_cache_slots_per_device_count = 0;
+        cparams.moe_cache_range = nullptr;
+    } else {
+        if (!params.expert_cache_slots_per_device.empty()) {
+            cparams.expert_cache_slots_per_device = params.expert_cache_slots_per_device.data();
+            cparams.expert_cache_slots_per_device_count = (int32_t) params.expert_cache_slots_per_device.size();
+        }
+        cparams.moe_cache_range = params.moe_cache_range.empty() ? nullptr : params.moe_cache_range.c_str();
+    }
+    if (spec_draft && (params.expert_cache_slots > 0 || !params.expert_cache_slots_per_device.empty())) {
         LOG_INF("%s: forcing expert cache slots to 0: speculative draft/MTP selection disables expert pooling\n", __func__);
     }
 

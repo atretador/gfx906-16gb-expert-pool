@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -23,6 +24,12 @@ struct llama_cparams {
 
     // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
     int32_t  expert_cache_slots = 0;
+
+    // per-device expert slots in device order (empty = use expert_cache_slots for all devices)
+    std::vector<int32_t> expert_cache_slots_per_device;
+
+    // per-device cached layer ranges from --moe-cache-range (empty = derive from ownership)
+    std::string moe_cache_range;
 
     // warmth gate: disable the expert pool for the rest of the context when its decode hit
     // rate stays below this percent after a warm-up window (0 = never fall back)
