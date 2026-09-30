@@ -884,6 +884,7 @@ struct ggml_backend_sched {
 
     uint64_t expert_pool_generation = 0;
     uint64_t expert_pool_next_report = 4096;
+    uint64_t expert_pool_report_interval = 4096;
 
     int debug;
 
@@ -1996,10 +1997,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (!sched->expert_pools.empty() && sched->expert_pool_generation >= sched->expert_pool_next_report) {
-        constexpr uint64_t report_interval = 4096;
         ggml_backend_sched_report_expert_pool_stats(sched, "interval");
-        sched->expert_pool_next_report = sched->expert_pool_generation > UINT64_MAX - report_interval ?
-            UINT64_MAX : sched->expert_pool_generation + report_interval;
+        sched->expert_pool_next_report = sched->expert_pool_generation > UINT64_MAX - sched->expert_pool_report_interval ?
+            UINT64_MAX : sched->expert_pool_generation + sched->expert_pool_report_interval;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2829,6 +2829,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 #endif
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
+
+    // graph executions between aggregate expert pool hit/miss reports (0 disables)
+    const char * GGML_MOE_POOL_REPORT_INTERVAL = getenv("GGML_MOE_POOL_REPORT_INTERVAL");
+    if (GGML_MOE_POOL_REPORT_INTERVAL != nullptr) {
+        sched->expert_pool_report_interval = strtoull(GGML_MOE_POOL_REPORT_INTERVAL, nullptr, 10);
+        sched->expert_pool_next_report = sched->expert_pool_report_interval > 0 ?
+            sched->expert_pool_report_interval : UINT64_MAX;
+    }
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;

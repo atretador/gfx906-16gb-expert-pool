@@ -67,6 +67,7 @@ Environment knobs:
 | `LLAMA_MOE_POOL_CAP_MIB` | Optional absolute cap on total pool bytes. Unset means no cap. `0` is rejected. |
 | `LLAMA_MOE_POOL_PROFILE` | Optional text file with one `blk.<layer_index> <weight>` line per layer for weighted slot allocation. Missing or malformed entries fall back to weight 1.0. |
 | `GGML_MOE_POOL_STATS` | Set to any value for per-pool hit/miss detail on top of the aggregate reports. |
+| `GGML_MOE_POOL_REPORT_INTERVAL` | Graph executions between aggregate expert-pool hit/miss reports. Default 4096. Set to 0 to disable the periodic report. |
 
 Telemetry, one line per event type, visible at the default log level:
 
