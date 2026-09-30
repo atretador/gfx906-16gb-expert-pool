@@ -2782,6 +2782,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
     add_opt(common_arg(
+        {"-mpf", "--moe-pool-fallback"}, "PCT",
+        "disable the MoE expert cache for the rest of the context when its decode hit rate\n"
+        "stays below PCT percent after a warm-up window; the stock host-weight path still\n"
+        "streams the used experts, but without the pool readbacks and table uploads\n"
+        "(0 = never fall back, default; requires --moe-expert-cache)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 100) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.expert_pool_fallback = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_POOL_FALLBACK"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

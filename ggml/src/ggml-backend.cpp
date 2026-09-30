@@ -883,8 +883,8 @@ struct ggml_backend_sched {
     std::vector<ggml_bitset_t> expert_ids_used;
 
     uint64_t expert_pool_generation = 0;
-    uint64_t expert_pool_next_report = 4096;
-    uint64_t expert_pool_report_interval = 4096;
+    uint64_t expert_pool_next_report = 1024;
+    uint64_t expert_pool_report_interval = 1024;
 
     int debug;
 

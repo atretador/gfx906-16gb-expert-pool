@@ -279,6 +279,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
 
     cparams.expert_cache_slots = params.expert_cache_slots;
+    cparams.expert_pool_fallback = params.expert_pool_fallback;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -2049,6 +2050,64 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+void llama_context::update_expert_pool_fallback() {
+    if (cparams.expert_pool_fallback <= 0 || expert_pools.empty()) {
+        return;
+    }
+    if (expert_pool_diagnostic_state->disabled.load()) {
+        return;
+    }
+
+    long long hits   = 0;
+    long long misses = 0;
+    ggml_backend_sched_get_expert_pool_stats(sched.get(), &hits, &misses, nullptr);
+
+    // only count graph executions that actually engaged the pool: prefill and oversized
+    // ubatches bypass it, so their runs leave the counters untouched
+    if (hits == expert_pool_fallback_last_hits && misses == expert_pool_fallback_last_misses) {
+        return;
+    }
+
+    // per-decode deltas, so the cold-start window cannot dominate the decision
+    const long long d_hits   = hits   - expert_pool_fallback_last_hits;
+    const long long d_misses = misses - expert_pool_fallback_last_misses;
+    expert_pool_fallback_last_hits   = hits;
+    expert_pool_fallback_last_misses = misses;
+    expert_pool_fallback_decodes++;
+
+    // warm-up: the pool needs a window of decode steps before its hit rate is meaningful
+    constexpr int64_t warmup_decodes = 64;
+    if (expert_pool_fallback_decodes <= warmup_decodes) {
+        return;
+    }
+
+    const long long d_total = d_hits + d_misses;
+    if (d_total <= 0) {
+        return;
+    }
+    const double rate = 100.0 * (double) d_hits / (double) d_total;
+
+    if (rate >= (double) cparams.expert_pool_fallback) {
+        expert_pool_fallback_below = 0;
+        return;
+    }
+
+    // require a few consecutive below-threshold decodes so one noisy step does not trip it
+    constexpr int64_t consecutive = 3;
+    if (++expert_pool_fallback_below < consecutive) {
+        return;
+    }
+
+    expert_pool_diagnostic_state->disabled.store(true);
+    // the decode graph is reused across steps; drop the cached graph so the next step rebuilds
+    // it and actually takes the host-weight path instead of the pooled one
+    gf_res_prev_active = nullptr;
+    if (!expert_pool_diagnostic_state->fallback_reported.exchange(true)) {
+        LLAMA_LOG_WARN("%s: expert pool disabled: window hit rate %.1f%% below threshold %d%% after %lld decode steps, using the host path for the rest of the context\n",
+                __func__, rate, cparams.expert_pool_fallback, (long long) expert_pool_fallback_decodes);
+    }
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2259,6 +2318,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
         }
+
+        update_expert_pool_fallback();
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -4065,6 +4126,7 @@ llama_context_params llama_context_default_params() {
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.expert_cache_slots          =*/ 0,
+        /*.expert_pool_fallback        =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

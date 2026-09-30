@@ -54,10 +54,45 @@ llama-server -m <model.gguf> --n-cpu-moe 48 -ngl 99 -c 131072 \
 
 - `--moe-expert-cache N` / `-mec N`: requested pool slots **per offloaded expert weight tensor**
   (not a global count, not tokens). Each tensor gets its own pool. `0` disables the pool.
+- `--moe-pool-fallback PCT` / `-mpf PCT`: disable the pool for the rest of the context once its
+  decode hit rate stays below `PCT` percent after a warm-up window. The stock host-weight path
+  still streams the used experts, just without the pool readbacks and table uploads. `0` (default)
+  never falls back.
 - `-ngl`/`--n-cpu-moe` decide how many layers are offloaded. The pool only applies to offloaded MoE
   tensors.
 - Decode-shaped operations (few tokens per step) use the pool. Large prefill batches bypass it and
   run the stock host-copy path, which is intentional.
+
+### Balancing fixed layers and the cache
+
+`--moe-expert-cache` and `--n-cpu-moe` compete for the same VRAM, so tune them together instead of
+maximizing either. An expert layer that is not offloaded stays resident on the GPU (a "fixed" layer).
+
+The two knobs drive different phases, so you can go all in on one or the other, or aim for a balance:
+
+- Prompt processing (pp) is driven by the fixed layers: more fixed layers (lower `--n-cpu-moe`) means
+  faster pp, because a fixed layer never copies and a large prefill batch bypasses the pool and streams
+  CPU-resident experts over PCIe.
+- Decode (tg) is driven by the expert cache allocation: more slots per tensor (larger
+  `--moe-expert-cache`) means a higher hit rate and faster tg, and it needs the VRAM that fixed layers
+  would otherwise occupy.
+
+The data below is for Qwen3.6-35B-A3B (40 MoE layers, so `--n-cpu-moe 40` offloads all of them) with
+only these two knobs moved (maintainer reports, not a controlled benchmark):
+
+| `--n-cpu-moe` | fixed layers | expert cache | prompt processing |
+| --- | --- | --- | --- |
+| 18 | 22 | 0 | about 800 t/s |
+| 27 | 13 | 20 | about 445 t/s |
+| 30 | 10 | 40 | about 400 t/s |
+| 40 | 0 | 85 | about 300 t/s |
+
+At `--n-cpu-moe 27` with expert cache 20 the pool hit rate was only 45.7%, so `--moe-pool-fallback 50`
+disabled the pool and decode continued on the host path: when the hit rate is that low the cache is not
+paying for its VRAM at that balance.
+
+These absolute numbers are specific to this model. On Qwen3.8-Flash-Next (48 layers) prompt processing
+is much lower, closer to about 80 t/s, so read the trend rather than the values.
 
 Environment knobs:
 
@@ -67,7 +102,8 @@ Environment knobs:
 | `LLAMA_MOE_POOL_CAP_MIB` | Optional absolute cap on total pool bytes. Unset means no cap. `0` is rejected. |
 | `LLAMA_MOE_POOL_PROFILE` | Optional text file with one `blk.<layer_index> <weight>` line per layer for weighted slot allocation. Missing or malformed entries fall back to weight 1.0. |
 | `GGML_MOE_POOL_STATS` | Set to any value for per-pool hit/miss detail on top of the aggregate reports. |
-| `GGML_MOE_POOL_REPORT_INTERVAL` | Graph executions between aggregate expert-pool hit/miss reports. Default 4096. Set to 0 to disable the periodic report. |
+| `GGML_MOE_POOL_REPORT_INTERVAL` | Graph executions between aggregate expert-pool hit/miss reports. Default 1024. Set to 0 to disable the periodic report. |
+| `LLAMA_ARG_MOE_POOL_FALLBACK` | `--moe-pool-fallback PCT` / `-mpf PCT`: disable the pool for the rest of the context when its decode hit rate stays below `PCT` percent. Default 0 (never). |
 
 Telemetry, one line per event type, visible at the default log level:
 

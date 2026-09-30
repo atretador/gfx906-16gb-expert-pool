@@ -1709,6 +1709,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
                    type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
     cparams.expert_cache_slots = spec_draft ? 0 : params.expert_cache_slots;
+    cparams.expert_pool_fallback = spec_draft ? 0 : params.expert_pool_fallback;
     if (spec_draft && params.expert_cache_slots > 0) {
         LOG_INF("%s: forcing expert cache slots to 0: speculative draft/MTP selection disables expert pooling\n", __func__);
     }

@@ -24,6 +24,10 @@ struct llama_cparams {
     // number of expert slots kept in VRAM per offloaded MoE expert weight tensor (0 = off)
     int32_t  expert_cache_slots = 0;
 
+    // warmth gate: disable the expert pool for the rest of the context when its decode hit
+    // rate stays below this percent after a warm-up window (0 = never fall back)
+    int32_t  expert_pool_fallback = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

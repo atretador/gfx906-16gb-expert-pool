@@ -374,6 +374,9 @@ extern "C" {
         int32_t  n_threads_batch;       // number of threads to use for batch processing
         int32_t  expert_cache_slots;    // number of expert slots cached in VRAM per offloaded
                                        // MoE expert weight tensor (0 = disabled) [EXPERIMENTAL]
+        int32_t  expert_pool_fallback;  // disable the expert pool for the rest of the context
+                                       // when its decode hit rate stays below this percent after
+                                       // a warm-up window (0 = never fall back) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

@@ -99,6 +99,11 @@ struct llm_graph_params;
 
 struct llama_expert_pool_diagnostic_state {
     std::atomic<bool> first_use_reported = false;
+    // set by the context when the warmth gate trips (see llama_context::update_expert_pool_fallback):
+    // the graph then stops routing experts through the pool and uses the stock host-weight path
+    // for the rest of the context
+    std::atomic<bool> disabled = false;
+    std::atomic<bool> fallback_reported = false;
 };
 
 // persistent VRAM pool serving an offloaded (host buffer) MoE expert weight tensor,

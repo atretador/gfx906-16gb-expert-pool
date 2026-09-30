@@ -1566,7 +1566,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             LLAMA_LOG_WARN("expert pool first-use=%s reason=%s\n", mode, reason);
         }
     };
-    if (expert_pools != nullptr) {
+    if (expert_pool_diagnostic_state != nullptr && expert_pool_diagnostic_state->disabled.load()) {
+        // the warmth gate tripped: use the stock host-weight path for the rest of the context
+        // (the trip is logged once by llama_context::update_expert_pool_fallback)
+    } else if (expert_pools != nullptr) {
         auto it = expert_pools->find(w);
         if (it != expert_pools->end()) {
             const llama_expert_pool & ep = it->second;

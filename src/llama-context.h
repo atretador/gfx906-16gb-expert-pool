@@ -273,6 +273,10 @@ private:
     // (cparams.expert_cache_slots > 0), called once after the scheduler is created
     void init_expert_pools();
 
+    // warmth gate for the expert pools: sample the pool hit rate after each decode and disable
+    // the pools for the rest of the context when it stays below cparams.expert_pool_fallback
+    void update_expert_pool_fallback();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -300,6 +304,12 @@ private:
     std::shared_ptr<llama_expert_pool_diagnostic_state> expert_pool_diagnostic_state =
         std::make_shared<llama_expert_pool_diagnostic_state>();
     bool expert_pool_status_reported = false;
+
+    // warmth gate bookkeeping (single-threaded, updated from llama_context::decode)
+    long long expert_pool_fallback_last_hits   = 0;
+    long long expert_pool_fallback_last_misses = 0;
+    int64_t   expert_pool_fallback_decodes     = 0;
+    int64_t   expert_pool_fallback_below       = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
